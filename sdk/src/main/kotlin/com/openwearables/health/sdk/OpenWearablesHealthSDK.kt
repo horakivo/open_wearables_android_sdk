@@ -453,13 +453,27 @@ class OpenWearablesHealthSDK private constructor(
     // Logging
     // -----------------------------------------------------------------------
 
-    /**
-     * Sets the log level. Convenience wrapper mirroring the iOS API, intended
-     * for cross-platform bridges (React Native, Flutter) and Java callers.
-     */
-    fun setLogLevel(level: OWLogLevel) {
-        this.logLevel = level
-    }
+    // Disabled: this explicit setter clashes with the auto-generated setter from
+    // `var logLevel` above. On the JVM, Kotlin compiles `var logLevel: OWLogLevel`
+    // into `setLogLevel(OWLogLevel): Unit` to satisfy JavaBeans conventions for
+    // Java/RN/Flutter interop. Re-declaring `fun setLogLevel(level: OWLogLevel)`
+    // produces a second method with the identical JVM signature
+    // `setLogLevel(Lcom/openwearables/health/sdk/OWLogLevel;)V`, which the JVM
+    // class format does not allow → Kotlin reports a "Platform declaration clash"
+    // at compile time and the build fails.
+    //
+    // The public property already gives Java/RN/Flutter callers `setLogLevel(...)`,
+    // so this wrapper is redundant. Restore only with `@JvmName("setLogLevelExplicit")`
+    // or after renaming, never as-is.
+    //
+    // /**
+    //  * Sets the log level. Convenience wrapper mirroring the iOS API, intended
+    //  * for cross-platform bridges (React Native, Flutter) and Java callers.
+    //  */
+    // fun setLogLevel(level: OWLogLevel) {
+    //     this.logLevel = level
+    // }
+
 
     internal fun logMessage(message: String) {
         when (logLevel) {
