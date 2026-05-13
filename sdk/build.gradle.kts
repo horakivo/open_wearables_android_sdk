@@ -6,6 +6,11 @@ plugins {
     id("maven-publish")
 }
 
+// Top-level version so the generated POM declares a real `<version>` instead of
+// the default "unspecified" (which JitPack serves as `<version>-SNAPSHOT</version>`
+// and Gradle then rejects with "inconsistent module metadata").
+version = "0.11.0"
+
 android {
     namespace = "com.openwearables.health.sdk"
     compileSdk = 36
