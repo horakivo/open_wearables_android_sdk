@@ -63,6 +63,9 @@ class SyncManager(
     private val onAuthError: ((Int, String) -> Unit)? = null
 ) {
     companion object {
+        // Health Connect's ReadRecordsRequest.pageSize is capped at 5000.
+        const val MAX_PAGE_SIZE = 5000
+
         val sharedHttpClient: OkHttpClient by lazy {
             OkHttpClient.Builder()
                 .connectTimeout(30, TimeUnit.SECONDS)
@@ -172,6 +175,7 @@ class SyncManager(
             syncIntervalMinutes, TimeUnit.MINUTES
         )
             .setConstraints(constraints)
+            .setInitialDelay(syncIntervalMinutes, TimeUnit.MINUTES)
             .setInputData(workDataOf(
                 HealthSyncWorker.KEY_HOST to host,
                 HealthSyncWorker.KEY_CUSTOM_SYNC_URL to customSyncUrl
@@ -837,9 +841,9 @@ class SyncManager(
                 var count = 0
                 var cursor = sinceTimestamp
                 while (true) {
-                    val result = healthProvider.readData(type, cursor, 10000)
+                    val result = healthProvider.readData(type, cursor, MAX_PAGE_SIZE)
                     count += result.data.totalCount
-                    if (result.data.totalCount < 10000 || result.maxTimestamp == null) break
+                    if (result.data.totalCount < MAX_PAGE_SIZE || result.maxTimestamp == null) break
                     cursor = result.maxTimestamp
                 }
                 counts[type] = count
@@ -851,6 +855,7 @@ class SyncManager(
         logger("Record counts: ${counts.entries.filter { it.value > 0 }.joinToString { "${it.key}=${it.value}" }}")
         return counts
     }
+
 
     private suspend fun sendSyncStartLog(logsEndpoint: String, types: List<String>, typeCounts: Map<String, Int>, startTimestamp: Long?) {
         val dataTypeCounts = types.map { mapOf("type" to payloadTypeName(it), "count" to (typeCounts[it] ?: 0)) }
