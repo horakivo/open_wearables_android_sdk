@@ -127,6 +127,7 @@ class HealthConnectManager(
         }
 
         permissions.add(HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND)
+        permissions.add(HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY)
 
         if (client == null && !connect()) return false
         val hcClient = client ?: return false
@@ -134,7 +135,7 @@ class HealthConnectManager(
         val alreadyGranted = hcClient.permissionController.getGrantedPermissions()
         val needed = permissions - alreadyGranted
         if (needed.isEmpty()) {
-            logger("All ${permissions.size} Health Connect permissions already granted (including background read)")
+            logger("All ${permissions.size} Health Connect permissions already granted (including background and history read)")
             return true
         }
 
@@ -148,7 +149,7 @@ class HealthConnectManager(
             val deferred = CompletableDeferred<Set<String>>()
             pendingPermissionResult = deferred
 
-            logger("Launching Health Connect permission dialog for ${needed.size} permissions (includes background read)")
+            logger("Launching Health Connect permission dialog for ${needed.size} permissions (includes background and history read)")
             launcher.launch(needed)
 
             val granted = deferred.await()
@@ -156,8 +157,13 @@ class HealthConnectManager(
 
             val totalGranted = alreadyGranted + granted
             val bgGranted = HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND in totalGranted
-            val dataPermsGranted = (permissions - HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND).all { it in totalGranted }
-            logger("Data permissions: ${if (dataPermsGranted) "all granted" else "some missing"}, background read: ${if (bgGranted) "granted" else "NOT granted"}")
+            val historyGranted = HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY in totalGranted
+            val specialPermissions = setOf(
+                HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND,
+                HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY
+            )
+            val dataPermsGranted = (permissions - specialPermissions).all { it in totalGranted }
+            logger("Data permissions: ${if (dataPermsGranted) "all granted" else "some missing"}, background read: ${if (bgGranted) "granted" else "NOT granted"}, history read: ${if (historyGranted) "granted" else "NOT granted"}")
             dataPermsGranted
         } catch (e: Exception) {
             logger("Health Connect permission request failed: ${e.message}")
