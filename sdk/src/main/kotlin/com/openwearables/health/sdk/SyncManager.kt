@@ -66,6 +66,11 @@ class SyncManager(
         // Health Connect's ReadRecordsRequest.pageSize is capped at 5000.
         const val MAX_PAGE_SIZE = 5000
 
+        // Process-wide: HealthSyncWorker builds its own SyncManager, so a
+        // per-instance flag would let a worker sync and a foreground syncNow()
+        // run concurrently against the same persisted sync state.
+        private val isSyncing = AtomicBoolean(false)
+
         val sharedHttpClient: OkHttpClient by lazy {
             OkHttpClient.Builder()
                 .connectTimeout(30, TimeUnit.SECONDS)
@@ -87,7 +92,6 @@ class SyncManager(
         java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
             .withZone(java.time.ZoneOffset.UTC)
 
-    private val isSyncing = AtomicBoolean(false)
     private val tokenRefreshLock = ReentrantLock()
     private var isRefreshingToken = false
 
@@ -162,7 +166,6 @@ class SyncManager(
 
     suspend fun startBackgroundSync(host: String, customSyncUrl: String?): Boolean {
         schedulePeriodicSync(host, customSyncUrl)
-        scheduleExpeditedSync(host, customSyncUrl)
         return true
     }
 
@@ -175,7 +178,6 @@ class SyncManager(
             syncIntervalMinutes, TimeUnit.MINUTES
         )
             .setConstraints(constraints)
-            .setInitialDelay(syncIntervalMinutes, TimeUnit.MINUTES)
             .setInputData(workDataOf(
                 HealthSyncWorker.KEY_HOST to host,
                 HealthSyncWorker.KEY_CUSTOM_SYNC_URL to customSyncUrl
@@ -204,8 +206,10 @@ class SyncManager(
             ))
             .build()
 
+        // KEEP: onBackground() schedules this on every backgrounding; REPLACE
+        // would cancel a sync that is already running instead of ignoring it.
         WorkManager.getInstance(context).enqueueUniqueWork(
-            SyncDefaults.WORK_NAME_EXPEDITED, ExistingWorkPolicy.REPLACE, expeditedWork
+            SyncDefaults.WORK_NAME_EXPEDITED, ExistingWorkPolicy.KEEP, expeditedWork
         )
         logger("Scheduled expedited sync")
     }
