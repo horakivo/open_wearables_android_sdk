@@ -362,10 +362,18 @@ class SyncManager(
             val roundResults = mutableListOf<FetchResult>()
 
             for (type in incompleteTypes) {
-                val result = if (fullExport) {
-                    fetchOneChunkNewestFirst(type, olderThanCursors[type], perTypeLimit)
+                // The limit is a Health Connect pageSize counting parent records;
+                // sleep sessions expand into many stage records, so page fewer of them.
+                val pageLimit = if (type == "sleep") {
+                    maxOf(1, perTypeLimit / SyncDefaults.SLEEP_STAGES_PER_SESSION_ESTIMATE)
                 } else {
-                    fetchOneChunkIncremental(type, anchorCursors[type], perTypeLimit)
+                    perTypeLimit
+                }
+
+                val result = if (fullExport) {
+                    fetchOneChunkNewestFirst(type, olderThanCursors[type], pageLimit)
+                } else {
+                    fetchOneChunkIncremental(type, anchorCursors[type], pageLimit)
                 }
 
                 roundResults.add(result)
