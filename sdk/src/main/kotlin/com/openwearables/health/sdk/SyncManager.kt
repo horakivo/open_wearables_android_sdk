@@ -268,10 +268,10 @@ class SyncManager(
 
             val syncStartTime = System.currentTimeMillis()
             val logsEndpoint = buildLogsEndpoint(host, userId)
+            currentLogsEndpoint = logsEndpoint
 
             if (effectiveFullExport) {
                 fullSyncStartTime = syncStartTime
-                currentLogsEndpoint = logsEndpoint
                 try {
                     logger("Counting records for sync start log...")
                     val typeCounts = countRecordsForTypes(trackedTypes, floor)
@@ -372,6 +372,7 @@ class SyncManager(
 
             // Phase 1: Fetch one chunk from each type (no network yet)
             val roundResults = mutableListOf<FetchResult>()
+            val roundDebug = mutableListOf<Map<String, Any>>()
 
             for (type in incompleteTypes) {
                 // The limit is a Health Connect pageSize counting parent records;
@@ -381,6 +382,7 @@ class SyncManager(
                 val pageLimit = maxOf(1, perTypeLimit / expansion)
                 logger("  $type: pageLimit=$pageLimit (perTypeLimit=$perTypeLimit / expansion=$expansion)")
 
+                val cursorBefore = if (fullExport) olderThanCursors[type] else anchorCursors[type]
                 val result = if (fullExport) {
                     fetchOneChunkNewestFirst(type, olderThanCursors[type], pageLimit)
                 } else {
@@ -395,6 +397,36 @@ class SyncManager(
                     if (fullExport) olderThanCursors[type] = result.nextCursor
                     else anchorCursors[type] = result.nextCursor
                 }
+
+                roundDebug.add(mapOf(
+                    "type" to type,
+                    "pageLimit" to pageLimit,
+                    "expansion" to expansion,
+                    "count" to result.count,
+                    "isDone" to result.isDone,
+                    "cursorBefore" to (cursorBefore ?: -1L),
+                    "cursorAfter" to ((if (fullExport) olderThanCursors[type] else anchorCursors[type]) ?: -1L)
+                ))
+            }
+
+            // Debug: post per-round state to the logs endpoint so it is visible
+            // server-side (logger() only writes to logcat). Sent before the data
+            // upload so it survives even if the round's send hangs or fails.
+            currentLogsEndpoint?.let { ep ->
+                val debugEvent: Map<String, Any> = mapOf(
+                    "eventType" to "sync_debug_round",
+                    "timestamp" to dateFormatter.format(java.time.Instant.now()),
+                    "roundNumber" to roundNumber,
+                    "fullExport" to fullExport,
+                    "perTypeLimit" to perTypeLimit,
+                    "incompleteTypes" to incompleteTypes,
+                    "types" to roundDebug
+                )
+                sendSyncLog(ep, mapOf(
+                    "sdkVersion" to SyncDefaults.SDK_VERSION,
+                    "provider" to healthProvider.providerId,
+                    "events" to listOf(debugEvent, collectDeviceState())
+                ))
             }
 
             // Phase 2: Merge all fetched data into one combined payload
