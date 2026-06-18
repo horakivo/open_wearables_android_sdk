@@ -309,18 +309,23 @@ class SyncManager(
         val type: String,
         val data: UnifiedHealthData = UnifiedHealthData(),
         val count: Int = 0,
+        // Parent records returned by this page (before expansion); drives the
+        // observed-expansion estimate used to size the next page.
+        val recordCount: Int = 0,
         val nextCursor: Long? = null,
         val anchorTimestamp: Long? = null,
         val isDone: Boolean = false
     )
 
-    // How many child records one parent record of this type expands into on
-    // convert. Used to shrink page limits for series/session types so a round's
-    // expanded payload stays near CHUNK_SIZE; 1 for plain 1:1 types.
-    private fun expandedRecordsPerParent(type: String): Int = when (type) {
-        "sleep" -> SyncDefaults.SLEEP_STAGES_PER_SESSION_ESTIMATE
-        "heartRate" -> SyncDefaults.HEART_RATE_SAMPLES_PER_RECORD_ESTIMATE
-        else -> 1
+    // Initial guess for how many child records one parent expands into on convert.
+    // Used only for the FIRST round of a type, before we've measured a real ratio;
+    // after that the page limit is sized from observed expansion (see the round loop).
+    // These constants are unreliable across devices (a HeartRateRecord may hold ~1 or
+    // ~40 samples), which is exactly why they're only a seed.
+    private fun seedExpansion(type: String): Double = when (type) {
+        "sleep" -> SyncDefaults.SLEEP_STAGES_PER_SESSION_ESTIMATE.toDouble()
+        "heartRate" -> SyncDefaults.HEART_RATE_SAMPLES_PER_RECORD_ESTIMATE.toDouble()
+        else -> 1.0
     }
 
     private suspend fun processTypesRoundRobin(
@@ -361,6 +366,12 @@ class SyncManager(
             }
         }
 
+        // Observed samples-per-parent for each type, learned from each full page and
+        // used to size the next page. Replaces the fixed expansion constants, which are
+        // wrong in both directions depending on the device. In-memory for this sync
+        // session; reseeds (and reconverges within a round) on resume.
+        val observedExpansion = mutableMapOf<String, Double>()
+
         var roundNumber = 0
         while (true) {
             val incompleteTypes = types.filter { !completedTypes.contains(it) }
@@ -375,12 +386,13 @@ class SyncManager(
             val roundDebug = mutableListOf<Map<String, Any>>()
 
             for (type in incompleteTypes) {
-                // The limit is a Health Connect pageSize counting parent records;
-                // series/session types expand into many child records on convert,
-                // so page fewer of them to keep the round near CHUNK_SIZE.
-                val expansion = expandedRecordsPerParent(type)
-                val pageLimit = maxOf(1, perTypeLimit / expansion)
-                logger("  $type: pageLimit=$pageLimit (perTypeLimit=$perTypeLimit / expansion=$expansion)")
+                // `pageLimit` is a Health Connect pageSize counting PARENT records; each
+                // parent expands into `expansion` child records on convert. Size the page
+                // so the expanded payload stays near the per-type budget, using the
+                // observed expansion (seeded on the first round, measured thereafter).
+                val expansion = observedExpansion[type] ?: seedExpansion(type)
+                val pageLimit = (perTypeLimit / expansion).toInt().coerceIn(1, MAX_PAGE_SIZE)
+                logger("  $type: pageLimit=$pageLimit (perTypeLimit=$perTypeLimit / expansion=${"%.2f".format(expansion)})")
 
                 val cursorBefore = if (fullExport) olderThanCursors[type] else anchorCursors[type]
                 val result = if (fullExport) {
@@ -398,10 +410,21 @@ class SyncManager(
                     else anchorCursors[type] = result.nextCursor
                 }
 
+                // Learn expansion only from a FULL page (recordCount >= pageLimit). The
+                // tail page is partial and its ratio (often a single fat/thin record)
+                // would skew the estimate, and it's about to complete anyway. EWMA
+                // smooths against a one-off dense page.
+                if (result.recordCount >= pageLimit && result.recordCount > 0) {
+                    val ratio = result.count.toDouble() / result.recordCount
+                    val prev = observedExpansion[type] ?: ratio
+                    observedExpansion[type] = 0.5 * prev + 0.5 * ratio
+                }
+
                 roundDebug.add(mapOf(
                     "type" to type,
                     "pageLimit" to pageLimit,
                     "expansion" to expansion,
+                    "recordCount" to result.recordCount,
                     "count" to result.count,
                     "isDone" to result.isDone,
                     "cursorBefore" to (cursorBefore ?: -1L),
@@ -544,7 +567,7 @@ class SyncManager(
         logger("  $type: ${data.totalCount} samples (newest first)")
 
         return FetchResult(
-            type = type, data = data, count = data.totalCount,
+            type = type, data = data, count = data.totalCount, recordCount = result.recordCount,
             nextCursor = nextOlderThan, anchorTimestamp = anchorTs, isDone = isLastChunk
         )
     }
@@ -570,7 +593,7 @@ class SyncManager(
         logger("  $type: $count samples; termination recordCount=${result.recordCount} < limit=$limit? $isLastChunk -> isDone=$isLastChunk, nextAnchor=${result.maxTimestamp?.let { java.time.Instant.ofEpochMilli(it) }}")
 
         return FetchResult(
-            type = type, data = result.data, count = count,
+            type = type, data = result.data, count = count, recordCount = result.recordCount,
             nextCursor = result.maxTimestamp, anchorTimestamp = result.maxTimestamp,
             isDone = isLastChunk
         )
