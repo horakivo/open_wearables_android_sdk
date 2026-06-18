@@ -314,6 +314,15 @@ class SyncManager(
         val isDone: Boolean = false
     )
 
+    // How many child records one parent record of this type expands into on
+    // convert. Used to shrink page limits for series/session types so a round's
+    // expanded payload stays near CHUNK_SIZE; 1 for plain 1:1 types.
+    private fun expandedRecordsPerParent(type: String): Int = when (type) {
+        "sleep" -> SyncDefaults.SLEEP_STAGES_PER_SESSION_ESTIMATE
+        "heartRate" -> SyncDefaults.HEART_RATE_SAMPLES_PER_RECORD_ESTIMATE
+        else -> 1
+    }
+
     private suspend fun processTypesRoundRobin(
         types: List<String>,
         fullExport: Boolean,
@@ -363,12 +372,9 @@ class SyncManager(
 
             for (type in incompleteTypes) {
                 // The limit is a Health Connect pageSize counting parent records;
-                // sleep sessions expand into many stage records, so page fewer of them.
-                val pageLimit = if (type == "sleep") {
-                    maxOf(1, perTypeLimit / SyncDefaults.SLEEP_STAGES_PER_SESSION_ESTIMATE)
-                } else {
-                    perTypeLimit
-                }
+                // series/session types expand into many child records on convert,
+                // so page fewer of them to keep the round near CHUNK_SIZE.
+                val pageLimit = maxOf(1, perTypeLimit / expandedRecordsPerParent(type))
 
                 val result = if (fullExport) {
                     fetchOneChunkNewestFirst(type, olderThanCursors[type], pageLimit)

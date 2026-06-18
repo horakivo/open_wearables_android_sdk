@@ -15,10 +15,18 @@ object SyncDefaults {
     const val MIN_SYNC_INTERVAL_MINUTES = 15L
     const val CHUNK_SIZE = 2000
 
+    // Some record types expand into many child records when converted, so
+    // their page limits are divided by these factors to keep the expanded
+    // record count of a round near CHUNK_SIZE (counting parent records 1:1
+    // would otherwise let a round balloon far past CHUNK_SIZE).
+    //
     // A sleep session expands into its individual stage records (often 50+
-    // per night), so sleep pages are divided by this factor to keep the
-    // expanded record count of a round near CHUNK_SIZE.
+    // per night).
     const val SLEEP_STAGES_PER_SESSION_ESTIMATE = 50
+
+    // A Health Connect HeartRateRecord is a series that expands into one
+    // record per sample (observed ~25-40 samples per series).
+    const val HEART_RATE_SAMPLES_PER_RECORD_ESTIMATE = 40
     const val WORK_NAME_PERIODIC = "health_sync_periodic"
     const val WORK_NAME_EXPEDITED = "health_sync_expedited"
     const val SDK_VERSION = "0.11.0"
