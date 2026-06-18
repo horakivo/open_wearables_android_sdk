@@ -525,9 +525,11 @@ class SyncManager(
         }
 
         val reachedFloor = floor != null && result.minTimestamp != null && result.minTimestamp <= floor
-        val isLastChunk = result.data.totalCount < limit || reachedFloor
+        // Compare the parent record count (what pageSize bounds) — not the expanded
+        // sample/stage count — so this is unit-correct for series/session types (sleep).
+        val isLastChunk = result.recordCount < limit || reachedFloor
 
-        logger("  $type: termination check totalCount=${result.data.totalCount} < limit=$limit? ${result.data.totalCount < limit}; reachedFloor=$reachedFloor -> isDone=$isLastChunk; minTs=${result.minTimestamp?.let { java.time.Instant.ofEpochMilli(it) }}, nextOlderThan=${if (isLastChunk) "null" else result.minTimestamp?.let { java.time.Instant.ofEpochMilli(it) }.toString()}")
+        logger("  $type: termination check recordCount=${result.recordCount} < limit=$limit? ${result.recordCount < limit}; reachedFloor=$reachedFloor -> isDone=$isLastChunk; minTs=${result.minTimestamp?.let { java.time.Instant.ofEpochMilli(it) }}, nextOlderThan=${if (isLastChunk) "null" else result.minTimestamp?.let { java.time.Instant.ofEpochMilli(it) }.toString()}")
 
         val data = if (reachedFloor && floorIso != null) result.data.filterSince(floorIso) else result.data
 
@@ -562,9 +564,10 @@ class SyncManager(
         }
 
         val count = result.data.totalCount
-        val isLastChunk = count < limit
+        // Parent record count, not expanded count, for a unit-correct last-page check.
+        val isLastChunk = result.recordCount < limit
 
-        logger("  $type: $count samples; termination totalCount=$count < limit=$limit? $isLastChunk -> isDone=$isLastChunk, nextAnchor=${result.maxTimestamp?.let { java.time.Instant.ofEpochMilli(it) }}")
+        logger("  $type: $count samples; termination recordCount=${result.recordCount} < limit=$limit? $isLastChunk -> isDone=$isLastChunk, nextAnchor=${result.maxTimestamp?.let { java.time.Instant.ofEpochMilli(it) }}")
 
         return FetchResult(
             type = type, data = result.data, count = count,

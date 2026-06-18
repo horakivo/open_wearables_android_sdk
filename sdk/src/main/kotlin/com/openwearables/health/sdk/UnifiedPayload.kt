@@ -167,7 +167,13 @@ data class UnifiedHealthData(
 data class ProviderReadResult(
     val data: UnifiedHealthData,
     val maxTimestamp: Long?,
-    val minTimestamp: Long? = null
+    val minTimestamp: Long? = null,
+    // Number of *parent* Health Connect records returned by this page (before any
+    // expansion into samples/stages). This is what `pageSize` actually bounds, so it
+    // is the correct unit for the "last page" check — comparing the expanded sample
+    // count against the page size is a unit mismatch that breaks paging for series/
+    // session types (e.g. sleep). 0 for empty/error reads, which reads as "last page".
+    val recordCount: Int = 0
 )
 
 // ---------------------------------------------------------------------------

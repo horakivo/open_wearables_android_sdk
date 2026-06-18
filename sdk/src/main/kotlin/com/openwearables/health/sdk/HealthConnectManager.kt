@@ -284,7 +284,7 @@ class HealthConnectManager(
             getRecordTimestamp(response.records.last())
         } else null
 
-        return ProviderReadResult(result.data, result.maxTimestamp, minTs)
+        return ProviderReadResult(result.data, result.maxTimestamp, minTs, recordCount = response.records.size)
     }
 
     private fun getRecordTimestamp(record: Record): Long? = when (record) {
@@ -699,7 +699,7 @@ class HealthConnectManager(
             response.records.last().endTime.toEpochMilli()
         } else null
 
-        return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs)
+        return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs, recordCount = response.records.size)
     }
 
     private fun mapSegmentType(type: Int): String = when (type) {
@@ -861,7 +861,7 @@ class HealthConnectManager(
             response.records.last().endTime.toEpochMilli()
         } else null
 
-        return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs)
+        return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs, recordCount = response.records.size)
     }
 
     private fun mapSleepStage(stage: Int): String = when (stage) {
