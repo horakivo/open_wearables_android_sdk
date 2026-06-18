@@ -277,7 +277,7 @@ class HealthConnectManager(
         val response = client.readRecords(request)
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
-        logger("Read ${response.records.size} ${T::class.simpleName} records${if (!ascending) " (newest first)" else ""}")
+        logger("  ${typeId}: requested pageSize=$limit, got ${response.records.size} ${T::class.simpleName} record(s)${if (!ascending) " (newest first)" else ""}")
         val result = convert(response.records)
 
         val minTs = if (!ascending && response.records.isNotEmpty()) {
@@ -812,6 +812,8 @@ class HealthConnectManager(
         )
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null)
 
+        logger("  sleep: requested pageSize=$limit, got ${response.records.size} session(s)")
+
         var maxTs: Long? = null
         val sleepEntries = mutableListOf<UnifiedSleep>()
 
@@ -852,6 +854,8 @@ class HealthConnectManager(
                 logger("  Failed to process sleep session: ${e.message}")
             }
         }
+
+        logger("  sleep: ${response.records.size} session(s) expanded to ${sleepEntries.size} stage record(s)")
 
         val minTs = if (!ascending && response.records.isNotEmpty()) {
             response.records.last().endTime.toEpochMilli()

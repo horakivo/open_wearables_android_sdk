@@ -361,11 +361,14 @@ class SyncManager(
             }
         }
 
+        var roundNumber = 0
         while (true) {
             val incompleteTypes = types.filter { !completedTypes.contains(it) }
             if (incompleteTypes.isEmpty()) break
 
+            roundNumber++
             val perTypeLimit = maxOf(1, SyncDefaults.CHUNK_SIZE / incompleteTypes.size)
+            logger("Round $roundNumber: ${incompleteTypes.size} incomplete type(s) [${incompleteTypes.joinToString(",")}], perTypeLimit=$perTypeLimit")
 
             // Phase 1: Fetch one chunk from each type (no network yet)
             val roundResults = mutableListOf<FetchResult>()
@@ -374,7 +377,9 @@ class SyncManager(
                 // The limit is a Health Connect pageSize counting parent records;
                 // series/session types expand into many child records on convert,
                 // so page fewer of them to keep the round near CHUNK_SIZE.
-                val pageLimit = maxOf(1, perTypeLimit / expandedRecordsPerParent(type))
+                val expansion = expandedRecordsPerParent(type)
+                val pageLimit = maxOf(1, perTypeLimit / expansion)
+                logger("  $type: pageLimit=$pageLimit (perTypeLimit=$perTypeLimit / expansion=$expansion)")
 
                 val result = if (fullExport) {
                     fetchOneChunkNewestFirst(type, olderThanCursors[type], pageLimit)
@@ -490,6 +495,8 @@ class SyncManager(
         val reachedFloor = floor != null && result.minTimestamp != null && result.minTimestamp <= floor
         val isLastChunk = result.data.totalCount < limit || reachedFloor
 
+        logger("  $type: termination check totalCount=${result.data.totalCount} < limit=$limit? ${result.data.totalCount < limit}; reachedFloor=$reachedFloor -> isDone=$isLastChunk; minTs=${result.minTimestamp?.let { java.time.Instant.ofEpochMilli(it) }}, nextOlderThan=${if (isLastChunk) "null" else result.minTimestamp?.let { java.time.Instant.ofEpochMilli(it) }.toString()}")
+
         val data = if (reachedFloor && floorIso != null) result.data.filterSince(floorIso) else result.data
 
         if (data.isEmpty) {
@@ -525,7 +532,7 @@ class SyncManager(
         val count = result.data.totalCount
         val isLastChunk = count < limit
 
-        logger("  $type: $count samples")
+        logger("  $type: $count samples; termination totalCount=$count < limit=$limit? $isLastChunk -> isDone=$isLastChunk, nextAnchor=${result.maxTimestamp?.let { java.time.Instant.ofEpochMilli(it) }}")
 
         return FetchResult(
             type = type, data = result.data, count = count,
