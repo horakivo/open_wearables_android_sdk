@@ -272,14 +272,17 @@ class SyncManager(
 
             if (effectiveFullExport) {
                 fullSyncStartTime = syncStartTime
-                try {
-                    logger("Counting records for sync start log...")
-                    val typeCounts = countRecordsForTypes(trackedTypes, floor)
-                    logger("Sending sync start log to $logsEndpoint")
-                    sendSyncStartLog(logsEndpoint, trackedTypes, typeCounts, floor)
-                } catch (e: Exception) {
-                    logger("Sync start log failed: ${e.message}")
-                }
+                // TEMP: disabled to measure its impact on sync start latency.
+                // countRecordsForTypes does a full read+convert pass over the
+                // entire history before the first upload round.
+                // try {
+                //     logger("Counting records for sync start log...")
+                //     val typeCounts = countRecordsForTypes(trackedTypes, floor)
+                //     logger("Sending sync start log to $logsEndpoint")
+                //     sendSyncStartLog(logsEndpoint, trackedTypes, typeCounts, floor)
+                // } catch (e: Exception) {
+                //     logger("Sync start log failed: ${e.message}")
+                // }
             }
 
             val result = processTypesRoundRobin(trackedTypes, effectiveFullExport, endpoint)
