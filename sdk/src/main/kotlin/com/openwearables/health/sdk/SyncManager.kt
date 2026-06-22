@@ -375,18 +375,14 @@ class SyncManager(
         // session; reseeds (and reconverges within a round) on resume.
         val observedExpansion = mutableMapOf<String, Double>()
 
-        var roundNumber = 0
         while (true) {
             val incompleteTypes = types.filter { !completedTypes.contains(it) }
             if (incompleteTypes.isEmpty()) break
 
-            roundNumber++
             val perTypeLimit = maxOf(1, SyncDefaults.CHUNK_SIZE / incompleteTypes.size)
-            logger("Round $roundNumber: ${incompleteTypes.size} incomplete type(s) [${incompleteTypes.joinToString(",")}], perTypeLimit=$perTypeLimit")
 
             // Phase 1: Fetch one chunk from each type (no network yet)
             val roundResults = mutableListOf<FetchResult>()
-            val roundDebug = mutableListOf<Map<String, Any>>()
 
             for (type in incompleteTypes) {
                 // `pageLimit` is a Health Connect pageSize counting PARENT records; each
@@ -395,9 +391,7 @@ class SyncManager(
                 // observed expansion (seeded on the first round, measured thereafter).
                 val expansion = observedExpansion[type] ?: seedExpansion(type)
                 val pageLimit = (perTypeLimit / expansion).toInt().coerceIn(1, MAX_PAGE_SIZE)
-                logger("  $type: pageLimit=$pageLimit (perTypeLimit=$perTypeLimit / expansion=${"%.2f".format(expansion)})")
 
-                val cursorBefore = if (fullExport) olderThanCursors[type] else anchorCursors[type]
                 val result = if (fullExport) {
                     fetchOneChunkNewestFirst(type, olderThanCursors[type], pageLimit)
                 } else {
@@ -422,37 +416,6 @@ class SyncManager(
                     val prev = observedExpansion[type] ?: ratio
                     observedExpansion[type] = 0.5 * prev + 0.5 * ratio
                 }
-
-                roundDebug.add(mapOf(
-                    "type" to type,
-                    "pageLimit" to pageLimit,
-                    "expansion" to expansion,
-                    "recordCount" to result.recordCount,
-                    "count" to result.count,
-                    "isDone" to result.isDone,
-                    "cursorBefore" to (cursorBefore ?: -1L),
-                    "cursorAfter" to ((if (fullExport) olderThanCursors[type] else anchorCursors[type]) ?: -1L)
-                ))
-            }
-
-            // Debug: post per-round state to the logs endpoint so it is visible
-            // server-side (logger() only writes to logcat). Sent before the data
-            // upload so it survives even if the round's send hangs or fails.
-            currentLogsEndpoint?.let { ep ->
-                val debugEvent: Map<String, Any> = mapOf(
-                    "eventType" to "sync_debug_round",
-                    "timestamp" to dateFormatter.format(java.time.Instant.now()),
-                    "roundNumber" to roundNumber,
-                    "fullExport" to fullExport,
-                    "perTypeLimit" to perTypeLimit,
-                    "incompleteTypes" to incompleteTypes,
-                    "types" to roundDebug
-                )
-                sendSyncLog(ep, mapOf(
-                    "sdkVersion" to SyncDefaults.SDK_VERSION,
-                    "provider" to healthProvider.providerId,
-                    "events" to listOf(debugEvent, collectDeviceState())
-                ))
             }
 
             // Phase 2: Merge all fetched data into one combined payload
