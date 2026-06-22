@@ -13,7 +13,7 @@ object ProviderDisplayNames {
 object SyncDefaults {
     const val SYNC_INTERVAL_MINUTES = 15L
     const val MIN_SYNC_INTERVAL_MINUTES = 15L
-    const val CHUNK_SIZE = 2000
+    const val CHUNK_SIZE = 4000
 
     // Some record types expand into many child records when converted, so
     // their page limits are divided by these factors to keep the expanded
