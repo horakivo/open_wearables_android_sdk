@@ -383,6 +383,7 @@ class SyncManager(
 
             // Phase 1: Fetch one chunk from each type (no network yet)
             val roundResults = mutableListOf<FetchResult>()
+            val fetchMsByType = mutableMapOf<String, Long>()
 
             for (type in incompleteTypes) {
                 // `pageLimit` is a Health Connect pageSize counting PARENT records; each
@@ -392,11 +393,13 @@ class SyncManager(
                 val expansion = observedExpansion[type] ?: seedExpansion(type)
                 val pageLimit = (perTypeLimit / expansion).toInt().coerceIn(1, MAX_PAGE_SIZE)
 
+                val fetchStart = System.nanoTime()
                 val result = if (fullExport) {
                     fetchOneChunkNewestFirst(type, olderThanCursors[type], pageLimit)
                 } else {
                     fetchOneChunkIncremental(type, anchorCursors[type], pageLimit)
                 }
+                fetchMsByType[type] = (System.nanoTime() - fetchStart) / 1_000_000
 
                 roundResults.add(result)
 
@@ -425,10 +428,13 @@ class SyncManager(
                 sleep = roundResults.flatMap { it.data.sleep }
             )
 
+            var uploadMs = 0L
             if (!mergedData.isEmpty) {
                 val payload = buildPayload(mergedData)
                 logPayloadSummary(mergedData)
+                val uploadStart = System.nanoTime()
                 val sendResult = sendPayload(endpoint, payload)
+                uploadMs = (System.nanoTime() - uploadStart) / 1_000_000
 
                 if (!sendResult.success) {
                     val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
@@ -450,6 +456,7 @@ class SyncManager(
 
             // Phase 3: Update progress for all types in this round
             val newlyCompletedTypes = mutableListOf<Pair<String, Int>>()
+            val persistStart = System.nanoTime()
             stateMutex.withLock {
                 for (result in roundResults) {
                     updateInMemoryProgress(result.type, result.count, isComplete = result.isDone, anchorTimestamp = result.anchorTimestamp)
@@ -462,6 +469,15 @@ class SyncManager(
                 }
                 persistStateToDisk()
             }
+            val persistMs = (System.nanoTime() - persistStart) / 1_000_000
+
+            // Per-round timing breakdown: read (Health Connect IPC + convert, summed
+            // across types since Phase 1 is sequential) vs upload (network round-trip)
+            // vs persist (state mutex + disk write). Read+upload don't overlap.
+            val totalFetchMs = fetchMsByType.values.sum()
+            val slowest = fetchMsByType.entries.sortedByDescending { it.value }.take(3)
+                .joinToString(", ") { "${it.key}=${it.value}ms" }
+            logger("Round timing: read ${totalFetchMs}ms (top: $slowest), upload ${uploadMs}ms, persist ${persistMs}ms")
 
             val startTime = fullSyncStartTime
             val logEndpoint = currentLogsEndpoint

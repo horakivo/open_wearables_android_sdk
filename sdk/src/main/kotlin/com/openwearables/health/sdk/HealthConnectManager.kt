@@ -274,11 +274,18 @@ class HealthConnectManager(
             pageSize = limit
         )
 
+        val readStart = System.nanoTime()
         val response = client.readRecords(request)
-        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
+        val readMs = (System.nanoTime() - readStart) / 1_000_000
+        if (response.records.isEmpty()) {
+            logger("  ${typeId}: readRecords IPC ${readMs}ms, 0 records")
+            return ProviderReadResult(UnifiedHealthData(), null, null)
+        }
 
-        logger("  ${typeId}: requested pageSize=$limit, got ${response.records.size} ${T::class.simpleName} record(s)${if (!ascending) " (newest first)" else ""}")
+        val convertStart = System.nanoTime()
         val result = convert(response.records)
+        val convertMs = (System.nanoTime() - convertStart) / 1_000_000
+        logger("  ${typeId}: pageSize=$limit, got ${response.records.size} ${T::class.simpleName}; readRecords IPC ${readMs}ms, convert ${convertMs}ms${if (!ascending) " (newest first)" else ""}")
 
         val minTs = if (!ascending && response.records.isNotEmpty()) {
             getRecordTimestamp(response.records.last())
@@ -622,6 +629,7 @@ class HealthConnectManager(
                 TimeRangeFilter.before(Instant.now())
         }
 
+        val readStart = System.nanoTime()
         val response = client.readRecords(
             ReadRecordsRequest(
                 recordType = ExerciseSessionRecord::class,
@@ -630,6 +638,8 @@ class HealthConnectManager(
                 pageSize = limit
             )
         )
+        val readMs = (System.nanoTime() - readStart) / 1_000_000
+        logger("  workout: pageSize=$limit, got ${response.records.size} session(s); readRecords IPC ${readMs}ms")
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
         var maxTs: Long? = null
@@ -802,6 +812,7 @@ class HealthConnectManager(
                 TimeRangeFilter.before(Instant.now())
         }
 
+        val readStart = System.nanoTime()
         val response = client.readRecords(
             ReadRecordsRequest(
                 recordType = SleepSessionRecord::class,
@@ -810,9 +821,10 @@ class HealthConnectManager(
                 pageSize = limit
             )
         )
+        val readMs = (System.nanoTime() - readStart) / 1_000_000
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null)
 
-        logger("  sleep: requested pageSize=$limit, got ${response.records.size} session(s)")
+        logger("  sleep: pageSize=$limit, got ${response.records.size} session(s); readRecords IPC ${readMs}ms")
 
         var maxTs: Long? = null
         val sleepEntries = mutableListOf<UnifiedSleep>()
