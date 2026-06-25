@@ -331,6 +331,12 @@ class SyncManager(
         else -> 1.0
     }
 
+    // Dense per-sample series whose page is sized by parent count (not expanded-payload
+    // budget) to amortize a large fixed per-read IPC cost. heartRate is the only such
+    // series this SDK reads; sleep expands too but pages by ~tens of sessions, advancing
+    // many days per read, so it does not need this treatment.
+    private fun isDenseSeries(type: String): Boolean = type == "heartRate"
+
     private suspend fun processTypesRoundRobin(
         types: List<String>,
         fullExport: Boolean,
@@ -386,12 +392,19 @@ class SyncManager(
             val fetchMsByType = mutableMapOf<String, Long>()
 
             for (type in incompleteTypes) {
-                // `pageLimit` is a Health Connect pageSize counting PARENT records; each
-                // parent expands into `expansion` child records on convert. Size the page
-                // so the expanded payload stays near the per-type budget, using the
+                // `pageLimit` is a Health Connect pageSize counting PARENT records.
+                // Dense per-sample series (heartRate) use a fixed parent-count page to
+                // amortize their large fixed read IPC cost (see HEART_RATE_READ_PAGE_PARENTS);
+                // the expanded payload is bounded later by sub-batched upload. Every other
+                // type expands into `expansion` child records on convert, so its page is
+                // sized to keep the expanded payload near the per-type budget, using the
                 // observed expansion (seeded on the first round, measured thereafter).
-                val expansion = observedExpansion[type] ?: seedExpansion(type)
-                val pageLimit = (perTypeLimit / expansion).toInt().coerceIn(1, MAX_PAGE_SIZE)
+                val pageLimit = if (isDenseSeries(type)) {
+                    SyncDefaults.HEART_RATE_READ_PAGE_PARENTS.coerceAtMost(MAX_PAGE_SIZE)
+                } else {
+                    val expansion = observedExpansion[type] ?: seedExpansion(type)
+                    (perTypeLimit / expansion).toInt().coerceIn(1, MAX_PAGE_SIZE)
+                }
 
                 val fetchStart = System.nanoTime()
                 val result = if (fullExport) {
@@ -430,28 +443,40 @@ class SyncManager(
 
             var uploadMs = 0L
             if (!mergedData.isEmpty) {
-                val payload = buildPayload(mergedData)
-                logPayloadSummary(mergedData)
-                val uploadStart = System.nanoTime()
-                val sendResult = sendPayload(endpoint, payload)
-                uploadMs = (System.nanoTime() - uploadStart) / 1_000_000
+                // A dense type's read page (heartRate) can expand well past CHUNK_SIZE,
+                // so split the merged round into bounded sub-batches and POST each. This
+                // keeps payload size and per-request upload time bounded regardless of how
+                // large the read pages were. Resume relies on the server upserting by
+                // record id: a mid-round failure re-reads and re-sends the whole round
+                // (Phase 3 progress is committed only after all batches succeed), so
+                // already-sent batches arrive again — at-least-once, matching the outbox.
+                val batches = chunkUnifiedData(mergedData, SyncDefaults.CHUNK_SIZE)
+                for ((i, batch) in batches.withIndex()) {
+                    val payload = buildPayload(batch)
+                    logPayloadSummary(batch)
+                    val uploadStart = System.nanoTime()
+                    val sendResult = sendPayload(endpoint, payload)
+                    uploadMs += (System.nanoTime() - uploadStart) / 1_000_000
 
-                if (!sendResult.success) {
-                    val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
-                    logger("Combined round failed ($reason)")
-                    val (totalSent, typeResults) = stateMutex.withLock {
-                        persistStateToDisk()
-                        val state = inMemoryState
-                        val sent = state?.totalSentCount ?: 0
-                        val results = types.map { type ->
-                            TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
+                    if (!sendResult.success) {
+                        val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
+                        logger("Combined round failed on batch ${i + 1}/${batches.size} ($reason)")
+                        val (totalSent, typeResults) = stateMutex.withLock {
+                            persistStateToDisk()
+                            val state = inMemoryState
+                            val sent = state?.totalSentCount ?: 0
+                            val results = types.map { type ->
+                                TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
+                            }
+                            Pair(sent, results)
                         }
-                        Pair(sent, results)
+                        return RoundRobinResult(false, totalSent, typeResults)
                     }
-                    return RoundRobinResult(false, totalSent, typeResults)
+
+                    logger("Round sent batch ${i + 1}/${batches.size}: ${batch.totalCount} items (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
                 }
 
-                logger("Round sent: ${mergedData.totalCount} items (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
+                logger("Round sent: ${mergedData.totalCount} items in ${batches.size} batch(es)")
             }
 
             // Phase 3: Update progress for all types in this round
@@ -595,6 +620,30 @@ class SyncManager(
     }
 
     // MARK: - Payload (unified)
+
+    // Split a merged round into payloads of at most [maxItems] expanded items
+    // (records + workouts + sleep), so a large dense-series read page is uploaded as
+    // several bounded POSTs instead of one oversized request. Items keep their original
+    // order; each batch fills records, then workouts, then sleep up to the budget.
+    private fun chunkUnifiedData(data: UnifiedHealthData, maxItems: Int): List<UnifiedHealthData> {
+        if (data.totalCount <= maxItems) return listOf(data)
+
+        val batches = mutableListOf<UnifiedHealthData>()
+        var records = data.records
+        var workouts = data.workouts
+        var sleep = data.sleep
+        while (records.isNotEmpty() || workouts.isNotEmpty() || sleep.isNotEmpty()) {
+            var budget = maxItems
+            val rTake = minOf(budget, records.size); budget -= rTake
+            val wTake = minOf(budget, workouts.size); budget -= wTake
+            val sTake = minOf(budget, sleep.size)
+            batches.add(UnifiedHealthData(records.take(rTake), workouts.take(wTake), sleep.take(sTake)))
+            records = records.drop(rTake)
+            workouts = workouts.drop(wTake)
+            sleep = sleep.drop(sTake)
+        }
+        return batches
+    }
 
     private fun buildPayload(data: UnifiedHealthData): Map<String, Any> = mapOf(
         "provider" to healthProvider.providerId,
