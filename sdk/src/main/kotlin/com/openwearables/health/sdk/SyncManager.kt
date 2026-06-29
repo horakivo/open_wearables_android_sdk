@@ -17,7 +17,10 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.Buffer
+import okio.ForwardingSink
 import okio.GzipSink
+import okio.Sink
 import okio.buffer
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -746,9 +749,30 @@ class SyncManager(
         override fun contentType() = body.contentType()
         override fun contentLength() = -1L
         override fun writeTo(sink: okio.BufferedSink) {
-            val gzipSink = GzipSink(sink).buffer()
-            body.writeTo(gzipSink)
-            gzipSink.close()
+            // Counters straddle the GzipSink: `compressed` sees the bytes that hit the
+            // socket (gzip output), `raw` sees the JSON the inner body produces (gzip
+            // input). Logs the on-the-wire savings and confirms compression is active.
+            val compressed = CountingSink(sink)
+            val gzip = GzipSink(compressed)
+            val raw = CountingSink(gzip)
+            val buffered = raw.buffer()
+            body.writeTo(buffered)
+            buffered.close()
+            val rawKb = raw.bytesWritten / 1024
+            val compKb = compressed.bytesWritten / 1024
+            val pct = if (raw.bytesWritten > 0) 100 * compressed.bytesWritten / raw.bytesWritten else 0
+            logger("Payload gzip: $rawKb KB -> $compKb KB ($pct% of original)")
+        }
+    }
+
+    /** Forwarding sink that tallies the bytes passing through it. */
+    private class CountingSink(delegate: Sink) : ForwardingSink(delegate) {
+        var bytesWritten = 0L
+            private set
+
+        override fun write(source: Buffer, byteCount: Long) {
+            super.write(source, byteCount)
+            bytesWritten += byteCount
         }
     }
 
