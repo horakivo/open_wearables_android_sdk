@@ -17,6 +17,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.GzipSink
+import okio.buffer
 import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -740,6 +742,16 @@ class SyncManager(
         return sendWithBody(endpoint, body)
     }
 
+    private fun gzipBody(body: RequestBody): RequestBody = object : RequestBody() {
+        override fun contentType() = body.contentType()
+        override fun contentLength() = -1L
+        override fun writeTo(sink: okio.BufferedSink) {
+            val gzipSink = GzipSink(sink).buffer()
+            body.writeTo(gzipSink)
+            gzipSink.close()
+        }
+    }
+
     /**
      * Creates an OkHttp RequestBody that streams JSON directly from the Map
      * to the network via android.util.JsonWriter. No intermediate JsonElement
@@ -793,8 +805,9 @@ class SyncManager(
             try {
                 val requestBuilder = Request.Builder()
                     .url(endpoint)
-                    .post(body)
+                    .post(gzipBody(body))
                     .header("Content-Type", "application/json")
+                    .header("Content-Encoding", "gzip")
                 applyAuth(requestBuilder)
 
                 val response = httpClient.newCall(requestBuilder.build()).execute()
@@ -830,8 +843,9 @@ class SyncManager(
                     return try {
                         val retryBuilder = Request.Builder()
                             .url(endpoint)
-                            .post(body)
+                            .post(gzipBody(body))
                             .header("Content-Type", "application/json")
+                            .header("Content-Encoding", "gzip")
                         applyAuth(retryBuilder, newCredential)
 
                         val retryResponse = httpClient.newCall(retryBuilder.build()).execute()
