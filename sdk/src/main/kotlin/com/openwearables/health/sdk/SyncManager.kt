@@ -446,10 +446,9 @@ class SyncManager(
                 // already-sent batches arrive again — at-least-once, matching the outbox.
                 val batches = chunkUnifiedData(mergedData, SyncDefaults.CHUNK_SIZE)
                 for ((i, batch) in batches.withIndex()) {
-                    val payload = buildPayload(batch)
                     logPayloadSummary(batch)
                     val uploadStart = System.nanoTime()
-                    val sendResult = sendPayload(endpoint, payload)
+                    val sendResult = sendPayload(endpoint, batch)
                     uploadMs += (System.nanoTime() - uploadStart) / 1_000_000
 
                     if (!sendResult.success) {
@@ -639,13 +638,6 @@ class SyncManager(
         return batches
     }
 
-    private fun buildPayload(data: UnifiedHealthData): Map<String, Any> = mapOf(
-        "provider" to healthProvider.providerId,
-        "sdkVersion" to SyncDefaults.SDK_VERSION,
-        "syncTimestamp" to UnifiedTimestamp.fromEpochMs(System.currentTimeMillis()),
-        "data" to data.toDataMap()
-    )
-
     // MARK: - Payload Summary Logging
 
     private fun logPayloadSummary(data: UnifiedHealthData) {
@@ -729,8 +721,8 @@ class SyncManager(
 
     private data class SendResult(val success: Boolean, val statusCode: Int?, val payloadSizeKb: Int)
 
-    private suspend fun sendPayload(endpoint: String, payload: Map<String, Any>): SendResult {
-        val body = streamingJsonBody(payload)
+    private suspend fun sendPayload(endpoint: String, data: UnifiedHealthData): SendResult {
+        val body = streamingUnifiedBody(data)
         return sendWithBody(endpoint, body)
     }
 
@@ -766,11 +758,42 @@ class SyncManager(
     }
 
     /**
-     * Creates an OkHttp RequestBody that streams JSON directly from the Map
-     * to the network via android.util.JsonWriter. No intermediate JsonElement
-     * tree or full String is allocated — only the writer's small internal buffer
-     * is held in heap, making memory usage O(depth) instead of O(n).
+     * OkHttp RequestBody that streams the sync payload straight from the typed
+     * [UnifiedHealthData] to the network via [writeUnifiedPayload] — no per-record `Map` is
+     * materialized (see UnifiedPayload.kt). Memory stays O(depth). The syncTimestamp is
+     * captured once here (not inside writeTo), so it's stable if the body is re-sent on retry.
      */
+    private fun streamingUnifiedBody(data: UnifiedHealthData): RequestBody {
+        val provider = healthProvider.providerId
+        val syncTimestamp = UnifiedTimestamp.fromEpochMs(System.currentTimeMillis())
+        return object : okhttp3.RequestBody() {
+            override fun contentType() = "application/json".toMediaType()
+            override fun writeTo(sink: okio.BufferedSink) {
+                val writer = android.util.JsonWriter(
+                    java.io.OutputStreamWriter(sink.outputStream(), Charsets.UTF_8)
+                )
+                writeUnifiedPayload(AndroidJsonWriterSink(writer), provider, SyncDefaults.SDK_VERSION, syncTimestamp, data)
+                writer.flush()
+            }
+        }
+    }
+
+    /** Adapts [JsonSink] onto android.util.JsonWriter (thin 1:1 delegation). */
+    private class AndroidJsonWriterSink(private val w: android.util.JsonWriter) : JsonSink {
+        override fun beginObject() { w.beginObject() }
+        override fun endObject() { w.endObject() }
+        override fun beginArray() { w.beginArray() }
+        override fun endArray() { w.endArray() }
+        override fun name(name: String) { w.name(name) }
+        override fun value(value: String?) { w.value(value) }
+        override fun value(value: Double) { w.value(value) }
+        override fun value(value: Long) { w.value(value) }
+        override fun value(value: Boolean) { w.value(value) }
+        override fun nullValue() { w.nullValue() }
+    }
+
+    /** Streams a small map (e.g. a sync-end log) to JSON. For the health payload use
+     *  [streamingUnifiedBody], which avoids per-record Map materialization. */
     private fun streamingJsonBody(payload: Map<String, Any>): RequestBody {
         return object : okhttp3.RequestBody() {
             override fun contentType() = "application/json".toMediaType()
@@ -778,38 +801,9 @@ class SyncManager(
                 val writer = android.util.JsonWriter(
                     java.io.OutputStreamWriter(sink.outputStream(), Charsets.UTF_8)
                 )
-                writeValue(writer, payload)
+                writeJsonValue(AndroidJsonWriterSink(writer), payload)
                 writer.flush()
             }
-        }
-    }
-
-    private fun writeValue(writer: android.util.JsonWriter, value: Any?) {
-        when (value) {
-            null -> writer.nullValue()
-            is Boolean -> writer.value(value)
-            is Int -> writer.value(value.toLong())
-            is Long -> writer.value(value)
-            is Float -> writer.value(value.toDouble())
-            is Double -> writer.value(value)
-            is Number -> writer.value(value.toDouble())
-            is String -> writer.value(value)
-            is Map<*, *> -> {
-                writer.beginObject()
-                for ((k, v) in value) {
-                    writer.name(k.toString())
-                    writeValue(writer, v)
-                }
-                writer.endObject()
-            }
-            is List<*> -> {
-                writer.beginArray()
-                for (item in value) {
-                    writeValue(writer, item)
-                }
-                writer.endArray()
-            }
-            else -> writer.value(value.toString())
         }
     }
 

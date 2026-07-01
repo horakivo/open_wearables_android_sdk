@@ -224,3 +224,148 @@ object DeviceTypeMapper {
         else -> "unknown"
     }
 }
+
+// ---------------------------------------------------------------------------
+// Streaming payload serializer
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal streaming JSON sink. Lets the payload serializer target both
+ * `android.util.JsonWriter` (production) and an in-memory recorder (tests) without
+ * pulling Android onto the unit-test classpath.
+ */
+interface JsonSink {
+    fun beginObject()
+    fun endObject()
+    fun beginArray()
+    fun endArray()
+    fun name(name: String)
+    fun value(value: String?)
+    fun value(value: Double)
+    fun value(value: Long)
+    fun value(value: Boolean)
+    fun nullValue()
+}
+
+/**
+ * Streams the full sync payload (envelope + data) straight to [sink], writing each record's
+ * fields directly instead of materializing a `Map` per record. This avoids the ~40 short-lived
+ * objects/record that `toDataMap()`/`toMap()` allocate (a major GC source during large syncs).
+ *
+ * Emits JSON semantically identical to the `toMap()`-based path — enforced by
+ * PayloadSerializerParityTest. Keep the field lists here in lock-step with the `toMap()`
+ * functions above.
+ */
+fun writeUnifiedPayload(
+    sink: JsonSink,
+    provider: String,
+    sdkVersion: String,
+    syncTimestamp: String,
+    data: UnifiedHealthData
+) {
+    sink.beginObject()
+    sink.name("provider"); sink.value(provider)
+    sink.name("sdkVersion"); sink.value(sdkVersion)
+    sink.name("syncTimestamp"); sink.value(syncTimestamp)
+    sink.name("data")
+    sink.beginObject()
+    sink.name("records"); sink.beginArray(); for (r in data.records) writeRecord(sink, r); sink.endArray()
+    sink.name("workouts"); sink.beginArray(); for (w in data.workouts) writeWorkout(sink, w); sink.endArray()
+    sink.name("sleep"); sink.beginArray(); for (s in data.sleep) writeSleep(sink, s); sink.endArray()
+    sink.endObject()
+    sink.endObject()
+}
+
+private fun writeSource(sink: JsonSink, s: UnifiedSource) {
+    sink.beginObject()
+    sink.name("appId"); sink.value(s.appId)
+    sink.name("deviceId"); sink.value(s.deviceId)
+    sink.name("deviceName"); sink.value(s.deviceName)
+    sink.name("deviceManufacturer"); sink.value(s.deviceManufacturer)
+    sink.name("deviceModel"); sink.value(s.deviceModel)
+    sink.name("deviceType"); sink.value(s.deviceType)
+    sink.name("recordingMethod"); sink.value(s.recordingMethod)
+    sink.endObject()
+}
+
+private fun writeRecord(sink: JsonSink, r: UnifiedRecord) {
+    sink.beginObject()
+    sink.name("id"); sink.value(r.id)
+    sink.name("type"); sink.value(r.type)
+    sink.name("startDate"); sink.value(r.startDate)
+    sink.name("endDate"); sink.value(r.endDate)
+    sink.name("zoneOffset"); sink.value(r.zoneOffset)
+    sink.name("source"); writeSource(sink, r.source)
+    sink.name("value"); sink.value(r.value)
+    sink.name("unit"); sink.value(r.unit)
+    sink.name("parentId"); sink.value(r.parentId)
+    sink.name("metadata"); writeJsonValue(sink, r.metadata)
+    sink.endObject()
+}
+
+private fun writeWorkout(sink: JsonSink, w: UnifiedWorkout) {
+    sink.beginObject()
+    sink.name("id"); sink.value(w.id)
+    sink.name("parentId"); sink.value(w.parentId)
+    sink.name("type"); sink.value(w.type)
+    sink.name("startDate"); sink.value(w.startDate)
+    sink.name("endDate"); sink.value(w.endDate)
+    sink.name("zoneOffset"); sink.value(w.zoneOffset)
+    sink.name("source"); writeSource(sink, w.source)
+    sink.name("title"); sink.value(w.title)
+    sink.name("notes"); sink.value(w.notes)
+    sink.name("values"); writeJsonValue(sink, w.values)
+    sink.name("segments"); writeJsonValue(sink, w.segments)
+    sink.name("laps"); writeJsonValue(sink, w.laps)
+    sink.name("route"); writeJsonValue(sink, w.route)
+    sink.name("samples"); writeJsonValue(sink, w.samples)
+    sink.name("metadata"); writeJsonValue(sink, w.metadata)
+    sink.endObject()
+}
+
+private fun writeSleep(sink: JsonSink, s: UnifiedSleep) {
+    sink.beginObject()
+    sink.name("id"); sink.value(s.id)
+    sink.name("parentId"); sink.value(s.parentId)
+    sink.name("stage"); sink.value(s.stage)
+    sink.name("startDate"); sink.value(s.startDate)
+    sink.name("endDate"); sink.value(s.endDate)
+    sink.name("zoneOffset"); sink.value(s.zoneOffset)
+    sink.name("source"); writeSource(sink, s.source)
+    sink.name("values"); writeJsonValue(sink, s.values)
+    sink.name("metadata"); writeJsonValue(sink, s.metadata)
+    sink.endObject()
+}
+
+/**
+ * Generic writer for the already-built, small nested structures (metadata, values, segments,
+ * laps, route, samples). Mirrors the number/typing rules the old map-walking serializer used
+ * (Int→Long, Float→Double, unknown→toString) so output is byte-identical. `internal` so the
+ * parity test can serialize the `toMap()`-based reference through the exact same rules.
+ */
+internal fun writeJsonValue(sink: JsonSink, value: Any?) {
+    when (value) {
+        null -> sink.nullValue()
+        is Boolean -> sink.value(value)
+        is Int -> sink.value(value.toLong())
+        is Long -> sink.value(value)
+        is Float -> sink.value(value.toDouble())
+        is Double -> sink.value(value)
+        is Number -> sink.value(value.toDouble())
+        is String -> sink.value(value)
+        is Map<*, *> -> {
+            sink.beginObject()
+            for ((k, v) in value) {
+                sink.name(k.toString())
+                writeJsonValue(sink, v)
+            }
+            sink.endObject()
+        }
+        is List<*> -> {
+            sink.beginArray()
+            for (item in value) writeJsonValue(sink, item)
+            sink.endArray()
+        }
+        else -> sink.value(value.toString())
+    }
+}
