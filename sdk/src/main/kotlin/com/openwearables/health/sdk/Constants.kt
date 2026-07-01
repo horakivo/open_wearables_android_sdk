@@ -28,16 +28,16 @@ object SyncDefaults {
     // record per sample (observed ~25-40 samples per series).
     const val HEART_RATE_SAMPLES_PER_RECORD_ESTIMATE = 40
 
-    // heartRate is read by a fixed PARENT-count page rather than by expanded-payload
-    // budget. Each Health Connect heartRate read has a large fixed IPC cost that is
-    // nearly independent of page size (observed: 9 parents ~2.1s, 35 parents ~0.7-2.3s),
-    // so sizing the page to keep the expanded payload near CHUNK_SIZE shrinks it to ~30
-    // parents — each ~2s read then advances the cursor only ~30 min and the round count
-    // explodes over a long history. A moderate parent page amortizes that fixed cost
-    // (advancing hours per read); the expanded result is uploaded in CHUNK_SIZE
-    // sub-batches so payload size and upload duration stay bounded. ~300 parents expands
-    // to ~8k samples (a few MB transient). Tune against the "Round timing" logs.
-    const val HEART_RATE_READ_PAGE_PARENTS = 300
+    // Target number of EXPANDED items (parents × samples-per-parent) to read per type per
+    // round. A type's page size in PARENT records is this divided by its observed expansion,
+    // capped at the Health Connect page limit. This adapts the read to the provider: a
+    // sparse provider (Garmin: ~1 sample per HeartRateRecord, expansion≈1) reads up to
+    // MAX_PAGE_SIZE parents, while a dense one (~25-40 samples per record) reads ~hundreds —
+    // both yielding a similar-sized expanded page, so the cursor advances efficiently in
+    // either case. Decoupled from CHUNK_SIZE (the upload batch): the round's expanded data
+    // is re-chunked to CHUNK_SIZE by sub-batched upload, so this can exceed it. ~8k items is
+    // a few MB transient. Tune against the "Round timing" logs.
+    const val READ_TARGET_EXPANDED_ITEMS = 8000
     const val WORK_NAME_PERIODIC = "health_sync_periodic"
     const val WORK_NAME_EXPEDITED = "health_sync_expedited"
     const val SDK_VERSION = "0.11.0"

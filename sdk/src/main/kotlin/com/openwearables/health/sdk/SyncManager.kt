@@ -336,11 +336,6 @@ class SyncManager(
         else -> 1.0
     }
 
-    // Dense per-sample series whose page is sized by parent count (not expanded-payload
-    // budget) to amortize a large fixed per-read IPC cost. heartRate is the only such
-    // series this SDK reads; sleep expands too but pages by ~tens of sessions, advancing
-    // many days per read, so it does not need this treatment.
-    private fun isDenseSeries(type: String): Boolean = type == "heartRate"
 
     private suspend fun processTypesRoundRobin(
         types: List<String>,
@@ -390,26 +385,21 @@ class SyncManager(
             val incompleteTypes = types.filter { !completedTypes.contains(it) }
             if (incompleteTypes.isEmpty()) break
 
-            val perTypeLimit = maxOf(1, SyncDefaults.CHUNK_SIZE / incompleteTypes.size)
-
             // Phase 1: Fetch one chunk from each type (no network yet)
             val roundResults = mutableListOf<FetchResult>()
             val fetchMsByType = mutableMapOf<String, Long>()
 
             for (type in incompleteTypes) {
-                // `pageLimit` is a Health Connect pageSize counting PARENT records.
-                // Dense per-sample series (heartRate) use a fixed parent-count page to
-                // amortize their large fixed read IPC cost (see HEART_RATE_READ_PAGE_PARENTS);
-                // the expanded payload is bounded later by sub-batched upload. Every other
-                // type expands into `expansion` child records on convert, so its page is
-                // sized to keep the expanded payload near the per-type budget, using the
-                // observed expansion (seeded on the first round, measured thereafter).
-                val pageLimit = if (isDenseSeries(type)) {
-                    SyncDefaults.HEART_RATE_READ_PAGE_PARENTS.coerceAtMost(MAX_PAGE_SIZE)
-                } else {
-                    val expansion = observedExpansion[type] ?: seedExpansion(type)
-                    (perTypeLimit / expansion).toInt().coerceIn(1, MAX_PAGE_SIZE)
-                }
+                // `pageLimit` is a Health Connect pageSize counting PARENT records. Size it so
+                // the EXPANDED payload (parents × observed samples-per-parent) targets
+                // READ_TARGET_EXPANDED_ITEMS, then cap at the Health Connect page limit. This
+                // adapts to how each provider writes a series: Garmin stores ~1 sample per
+                // HeartRateRecord (expansion≈1 → read up to MAX_PAGE_SIZE parents), while
+                // Wear-style providers pack ~25-40 samples per record (expansion high → ~hundreds
+                // of parents). The read is decoupled from the upload, which is re-chunked to
+                // CHUNK_SIZE by sub-batching, so a large expanded page is fine.
+                val expansion = observedExpansion[type] ?: seedExpansion(type)
+                val pageLimit = (SyncDefaults.READ_TARGET_EXPANDED_ITEMS / expansion).toInt().coerceIn(1, MAX_PAGE_SIZE)
 
                 val fetchStart = System.nanoTime()
                 val result = if (fullExport) {
@@ -428,14 +418,13 @@ class SyncManager(
                     else anchorCursors[type] = result.nextCursor
                 }
 
-                // Learn expansion only from a FULL page (recordCount >= pageLimit). The
-                // tail page is partial and its ratio (often a single fat/thin record)
-                // would skew the estimate, and it's about to complete anyway. EWMA
-                // smooths against a one-off dense page.
+                // Learn the real expansion from a FULL page and use it directly: a provider
+                // writes a series consistently, so the measured samples-per-parent is stable
+                // and the next page can jump straight to the right size (converges in one
+                // round, vs several with smoothing). Only full pages update it — the tail
+                // page is partial and its ratio would skew the estimate.
                 if (result.recordCount >= pageLimit && result.recordCount > 0) {
-                    val ratio = result.count.toDouble() / result.recordCount
-                    val prev = observedExpansion[type] ?: ratio
-                    observedExpansion[type] = 0.5 * prev + 0.5 * ratio
+                    observedExpansion[type] = result.count.toDouble() / result.recordCount
                 }
             }
 
