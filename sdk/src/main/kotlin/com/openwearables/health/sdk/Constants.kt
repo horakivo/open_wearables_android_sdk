@@ -13,7 +13,10 @@ object ProviderDisplayNames {
 object SyncDefaults {
     const val SYNC_INTERVAL_MINUTES = 15L
     const val MIN_SYNC_INTERVAL_MINUTES = 15L
-    const val CHUNK_SIZE = 4000
+    // Sized so a typical round (READ_TARGET_EXPANDED_ITEMS) uploads as ONE POST —
+    // each extra batch costs a full server round-trip. 8000 items ≈ 3.4 MB JSON,
+    // ~300 KB gzipped on the wire.
+    const val CHUNK_SIZE = 8000
 
     // Some record types expand into many child records when converted, so
     // their page limits are divided by these factors to keep the expanded
