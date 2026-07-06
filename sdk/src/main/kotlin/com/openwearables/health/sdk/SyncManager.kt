@@ -3,6 +3,9 @@ package com.openwearables.health.sdk
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.work.*
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -325,6 +328,13 @@ class SyncManager(
         val isDone: Boolean = false
     )
 
+    // One round's worth of fetched pages (Phase 1 output), so a round can be read
+    // ahead (prefetched) while the previous round is still uploading.
+    private data class RoundFetch(
+        val results: List<FetchResult>,
+        val fetchMsByType: Map<String, Long>
+    )
+
     // Initial guess for how many child records one parent expands into on convert.
     // Used only for the FIRST round of a type, before we've measured a real ratio;
     // after that the page limit is sized from observed expansion (see the round loop).
@@ -341,7 +351,7 @@ class SyncManager(
         types: List<String>,
         fullExport: Boolean,
         endpoint: String
-    ): RoundRobinResult {
+    ): RoundRobinResult = coroutineScope {
         val olderThanCursors = mutableMapOf<String, Long?>()
         val anchorCursors = mutableMapOf<String, Long?>()
         val completedTypes = mutableSetOf<String>()
@@ -381,11 +391,14 @@ class SyncManager(
         // session; reseeds (and reconverges within a round) on resume.
         val observedExpansion = mutableMapOf<String, Double>()
 
-        while (true) {
+        // Phase 1 as a function: runs inline for the first round, then as a prefetch
+        // overlapped with the previous round's upload. It never runs concurrently with
+        // itself — the loop awaits the previous prefetch before starting the next — so
+        // the cursor/completion/expansion maps stay single-writer.
+        suspend fun fetchRound(): RoundFetch? {
             val incompleteTypes = types.filter { !completedTypes.contains(it) }
-            if (incompleteTypes.isEmpty()) break
+            if (incompleteTypes.isEmpty()) return null
 
-            // Phase 1: Fetch one chunk from each type (no network yet)
             val roundResults = mutableListOf<FetchResult>()
             val fetchMsByType = mutableMapOf<String, Long>()
 
@@ -427,6 +440,24 @@ class SyncManager(
                     observedExpansion[type] = result.count.toDouble() / result.recordCount
                 }
             }
+            return RoundFetch(roundResults, fetchMsByType)
+        }
+
+        var prefetched: Deferred<RoundFetch?>? = null
+
+        while (true) {
+            val round = (prefetched?.await() ?: fetchRound()) ?: break
+            val roundResults = round.results
+            val fetchMsByType = round.fetchMsByType
+
+            // Pipeline: start reading the next round now, so the Health Connect IPC +
+            // convert runs while this round serializes and uploads. This round's fetch
+            // already advanced the session-local cursors and completedTypes, so the
+            // prefetch reads the correct next pages. If this round's upload fails, the
+            // prefetch is cancelled and its data discarded — durable progress is only
+            // committed in Phase 3, so resume re-reads it. Costs at most one extra
+            // round of fetched data held in memory.
+            prefetched = async { fetchRound() }
 
             // Phase 2: Merge all fetched data into one combined payload
             val mergedData = UnifiedHealthData(
@@ -454,6 +485,7 @@ class SyncManager(
                     if (!sendResult.success) {
                         val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
                         logger("Combined round failed on batch ${i + 1}/${batches.size} ($reason)")
+                        prefetched?.cancel()
                         val (totalSent, typeResults) = stateMutex.withLock {
                             persistStateToDisk()
                             val state = inMemoryState
@@ -463,7 +495,7 @@ class SyncManager(
                             }
                             Pair(sent, results)
                         }
-                        return RoundRobinResult(false, totalSent, typeResults)
+                        return@coroutineScope RoundRobinResult(false, totalSent, typeResults)
                     }
 
                     logger("Round sent batch ${i + 1}/${batches.size}: ${batch.totalCount} items (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
@@ -490,8 +522,10 @@ class SyncManager(
             val persistMs = (System.nanoTime() - persistStart) / 1_000_000
 
             // Per-round timing breakdown: read (Health Connect IPC + convert, summed
-            // across types since Phase 1 is sequential) vs upload (network round-trip)
-            // vs persist (state mutex + disk write). Read+upload don't overlap.
+            // across types since a fetch is sequential over types) vs upload (network
+            // round-trip) vs persist (state mutex + disk write). From round 2 on, the
+            // logged read time was spent overlapped with the PREVIOUS round's upload,
+            // so it no longer adds to wall-clock unless it exceeds the upload time.
             val totalFetchMs = fetchMsByType.values.sum()
             val slowest = fetchMsByType.entries.sortedByDescending { it.value }.take(3)
                 .joinToString(", ") { "${it.key}=${it.value}ms" }
@@ -525,7 +559,7 @@ class SyncManager(
             clearSyncSessionInternal()
             Pair(sent, results)
         }
-        return RoundRobinResult(true, totalSent, typeResults)
+        RoundRobinResult(true, totalSent, typeResults)
     }
 
     // MARK: - Fetch-Only Chunk Processors (no network)
