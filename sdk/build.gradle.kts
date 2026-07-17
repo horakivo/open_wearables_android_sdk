@@ -9,7 +9,7 @@ plugins {
 // Top-level version so the generated POM declares a real `<version>` instead of
 // the default "unspecified" (which JitPack serves as `<version>-SNAPSHOT</version>`
 // and Gradle then rejects with "inconsistent module metadata").
-version = "0.11.0"
+version = "0.12.0"
 
 android {
     namespace = "com.openwearables.health.sdk"
@@ -85,7 +85,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.openwearables.health"
                 artifactId = "sdk"
-                version = "0.11.0"
+                version = "0.12.0"
 
                 pom {
                     name.set("Open Wearables Health SDK")

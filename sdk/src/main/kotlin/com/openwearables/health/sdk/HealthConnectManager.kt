@@ -6,9 +6,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.PermissionController
+import androidx.health.connect.client.changes.DeletionChange
+import androidx.health.connect.client.changes.UpsertionChange
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.*
 import androidx.health.connect.client.records.metadata.Metadata
+import androidx.health.connect.client.request.ChangesTokenRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import kotlinx.coroutines.CompletableDeferred
@@ -199,6 +202,103 @@ class HealthConnectManager(
         limit = limit,
         ascending = false
     )
+
+    // -----------------------------------------------------------------------
+    // Changes API (change-log based incremental sync)
+    // -----------------------------------------------------------------------
+
+    override val supportsChanges: Boolean get() = true
+
+    override suspend fun getChangesToken(typeId: String): String? = withContext(dispatchers.io) {
+        val recordClass = mapToRecordClass(typeId) ?: return@withContext null
+        if (client == null) withContext(dispatchers.main) { connect() }
+        val hcClient = client ?: return@withContext null
+        try {
+            hcClient.getChangesToken(ChangesTokenRequest(recordTypes = setOf(recordClass)))
+        } catch (e: Exception) {
+            logger("  $typeId: getChangesToken failed: ${e.javaClass.simpleName}: ${e.message}")
+            null
+        }
+    }
+
+    override suspend fun readChanges(typeId: String, changesToken: String): ProviderChangesResult =
+        withContext(dispatchers.io) {
+            if (client == null) withContext(dispatchers.main) { connect() }
+            val hcClient = client ?: return@withContext ProviderChangesResult()
+            try {
+                val readStart = System.nanoTime()
+                val response = hcClient.getChanges(changesToken)
+                val readMs = (System.nanoTime() - readStart) / 1_000_000
+
+                if (response.changesTokenExpired) {
+                    logger("  $typeId: changes token expired")
+                    return@withContext ProviderChangesResult(tokenExpired = true)
+                }
+
+                // Known limitation: an in-place UPDATE that shrinks a series/session record
+                // (same UID, fewer samples/stages) re-expands into children {uid}-s0..s{N-1}
+                // without tombstoning the removed higher-index children, which stay stale on
+                // the server. Providers normally rewrite series via delete+insert (new UID),
+                // which lands here as DeletionChange + new record and is handled correctly.
+                val upserted = mutableListOf<Record>()
+                val deletedIds = mutableListOf<String>()
+                for (change in response.changes) {
+                    when (change) {
+                        is UpsertionChange -> upserted.add(change.record)
+                        is DeletionChange -> deletedIds.add(change.recordId)
+                    }
+                }
+
+                val converted = if (upserted.isEmpty()) ProviderReadResult(UnifiedHealthData(), null)
+                else convertRecordsForType(typeId, upserted)
+
+                logger("  $typeId: getChanges IPC ${readMs}ms, ${upserted.size} upsert(s), ${deletedIds.size} deletion(s), hasMore=${response.hasMore}")
+
+                ProviderChangesResult(
+                    data = converted.data,
+                    deletedIds = deletedIds,
+                    nextToken = response.nextChangesToken,
+                    hasMore = response.hasMore,
+                    maxTimestamp = converted.maxTimestamp,
+                    recordCount = upserted.size
+                )
+            } catch (e: SecurityException) {
+                logger("  $typeId: missing permission for changes, skipping")
+                ProviderChangesResult()
+            } catch (e: Exception) {
+                logger("Failed to read $typeId changes from Health Connect: ${e.javaClass.simpleName}: ${e.message}")
+                ProviderChangesResult()
+            }
+        }
+
+    /**
+     * Converts already-fetched records of a known [typeId]. Used by the changes path:
+     * a changes token is captured per record type, so a page only contains that type.
+     */
+    private fun convertRecordsForType(typeId: String, records: List<Record>): ProviderReadResult = when (typeId) {
+        "steps" -> convertSteps(records.filterIsInstance<StepsRecord>())
+        "heartRate" -> convertHeartRate(records.filterIsInstance<HeartRateRecord>())
+        "restingHeartRate" -> convertRestingHeartRate(records.filterIsInstance<RestingHeartRateRecord>())
+        "heartRateVariabilitySDNN" -> convertHrv(records.filterIsInstance<HeartRateVariabilityRmssdRecord>())
+        "oxygenSaturation" -> convertOxygenSaturation(records.filterIsInstance<OxygenSaturationRecord>())
+        "bloodPressure", "bloodPressureSystolic", "bloodPressureDiastolic" -> convertBloodPressure(records.filterIsInstance<BloodPressureRecord>())
+        "bloodGlucose" -> convertBloodGlucose(records.filterIsInstance<BloodGlucoseRecord>())
+        "activeEnergy" -> convertActiveCalories(records.filterIsInstance<ActiveCaloriesBurnedRecord>())
+        "basalEnergy" -> convertBasalCalories(records.filterIsInstance<BasalMetabolicRateRecord>())
+        "bodyTemperature" -> convertBodyTemperature(records.filterIsInstance<BodyTemperatureRecord>())
+        "bodyMass" -> convertWeight(records.filterIsInstance<WeightRecord>())
+        "height" -> convertHeight(records.filterIsInstance<HeightRecord>())
+        "bodyFatPercentage" -> convertBodyFat(records.filterIsInstance<BodyFatRecord>())
+        "leanBodyMass" -> convertLeanBodyMass(records.filterIsInstance<LeanBodyMassRecord>())
+        "flightsClimbed" -> convertFloors(records.filterIsInstance<FloorsClimbedRecord>())
+        "distanceWalkingRunning", "distanceCycling" -> convertDistance(records.filterIsInstance<DistanceRecord>())
+        "water", "dietaryWater" -> convertHydration(records.filterIsInstance<HydrationRecord>())
+        "vo2Max" -> convertVo2Max(records.filterIsInstance<Vo2MaxRecord>())
+        "respiratoryRate" -> convertRespiratoryRate(records.filterIsInstance<RespiratoryRateRecord>())
+        "workout" -> convertWorkouts(records.filterIsInstance<ExerciseSessionRecord>())
+        "sleep" -> convertSleepSessions(records.filterIsInstance<SleepSessionRecord>())
+        else -> ProviderReadResult(UnifiedHealthData(), null)
+    }
 
     private suspend fun readRecordsInternal(
         typeId: String,
@@ -642,8 +742,18 @@ class HealthConnectManager(
         logger("  workout: pageSize=$limit, got ${response.records.size} session(s); readRecords IPC ${readMs}ms")
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
+        val result = convertWorkouts(response.records)
+
+        val minTs = if (!ascending && response.records.isNotEmpty()) {
+            response.records.last().endTime.toEpochMilli()
+        } else null
+
+        return ProviderReadResult(result.data, result.maxTimestamp, minTs, recordCount = response.records.size)
+    }
+
+    private fun convertWorkouts(records: List<ExerciseSessionRecord>): ProviderReadResult {
         var maxTs: Long? = null
-        val workouts = response.records.map { r ->
+        val workouts = records.map { r ->
             val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
             val source = buildSource(r.metadata)
             val zo = zoneStr(r.startZoneOffset)
@@ -705,11 +815,7 @@ class HealthConnectManager(
             )
         }
 
-        val minTs = if (!ascending && response.records.isNotEmpty()) {
-            response.records.last().endTime.toEpochMilli()
-        } else null
-
-        return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs, recordCount = response.records.size)
+        return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs)
     }
 
     private fun mapSegmentType(type: Int): String = when (type) {
@@ -826,10 +932,20 @@ class HealthConnectManager(
 
         logger("  sleep: pageSize=$limit, got ${response.records.size} session(s); readRecords IPC ${readMs}ms")
 
+        val result = convertSleepSessions(response.records)
+
+        val minTs = if (!ascending && response.records.isNotEmpty()) {
+            response.records.last().endTime.toEpochMilli()
+        } else null
+
+        return ProviderReadResult(result.data, result.maxTimestamp, minTs, recordCount = response.records.size)
+    }
+
+    private fun convertSleepSessions(records: List<SleepSessionRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val sleepEntries = mutableListOf<UnifiedSleep>()
 
-        for (r in response.records) {
+        for (r in records) {
             try {
                 val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
                 val source = buildSource(r.metadata)
@@ -867,13 +983,9 @@ class HealthConnectManager(
             }
         }
 
-        logger("  sleep: ${response.records.size} session(s) expanded to ${sleepEntries.size} stage record(s)")
+        logger("  sleep: ${records.size} session(s) expanded to ${sleepEntries.size} stage record(s)")
 
-        val minTs = if (!ascending && response.records.isNotEmpty()) {
-            response.records.last().endTime.toEpochMilli()
-        } else null
-
-        return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs, recordCount = response.records.size)
+        return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs)
     }
 
     private fun mapSleepStage(stage: Int): String = when (stage) {

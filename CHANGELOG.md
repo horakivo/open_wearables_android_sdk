@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.0
+
+* **Health Connect Changes API for incremental sync**: incremental syncs now consume Health Connect's change log (`getChangesToken`/`getChanges`, one token per tracked type) instead of filtering by record timestamps. This picks up backfilled history (e.g. a Garmin/Fitbit companion app landing hours-old data after the anchor had already passed it), record updates, and record deletions — all of which the previous timestamp anchor silently missed.
+  - The change-log token is captured **before** the first full-export page, so records written while the export runs are covered by the token afterwards.
+  - Existing installs migrate transparently: the first incremental sync after the update captures a token, gap-fills once via the old timestamp anchor, and switches to the change log from the next sync on.
+  - Expired tokens (Health Connect prunes its change log after ~30 days without a sync) fall back the same way: fresh token first, timestamp gap-fill from the stored anchor, change log resumes next sync. Timestamp anchors are still maintained as the fallback floor and never move backwards.
+  - Samsung Health is unaffected and keeps the timestamp-based path (its Data SDK has no change log).
+* **Deletion propagation**: the sync payload's `data` object has a new `deleted` array of `{id, type}` tombstones populated from Health Connect `DeletionChange` entries. **Server contract**: for each tombstone, delete the stored record whose id equals `id` *and* any records whose `parentId` equals `id` (series/session records are expanded client-side into children keyed by the parent record id). Requires server support; servers that ignore unknown payload keys are unaffected otherwise.
+* Record updates arriving via the change log are re-sent under the same record `id` — server ingestion must upsert by `(userId, id)` (already required by resume/at-least-once delivery).
+* **Known limitation**: an *in-place update* that shrinks a series/session record (fewer heart-rate samples or sleep stages under the same record UID) re-upserts children `{uid}-s0…s{N-1}` but emits no tombstone for the removed higher-index children, so those stay stale on the server. In practice providers rewrite series via delete + insert (new UID), which the change log handles correctly via `DeletionChange`; the in-place shrink path is deferred — fixing it needs replace-tombstones plus a same-payload exclusion rule in the server's deletion query.
+
 ## 0.11.0
 
 * **Public `setLogLevel(level)` method** added for parity with iOS. Convenience wrapper around the existing `logLevel` property, intended for cross-platform bridges (React Native, Flutter) and Java callers. The `logLevel` property remains available.

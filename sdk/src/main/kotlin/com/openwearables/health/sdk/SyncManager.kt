@@ -37,7 +37,15 @@ data class TypeSyncProgress(
     var sentCount: Int = 0,
     var isComplete: Boolean = false,
     var pendingAnchorTimestamp: Long? = null,
-    var pendingOlderThan: Long? = null
+    var pendingOlderThan: Long? = null,
+    // Change-log read cursor: the nextChangesToken of the last uploaded changes page.
+    var pendingChangesToken: String? = null,
+    // Token freshly captured at full-export start or during a timestamp fallback
+    // (legacy install / expired token). NOT a read cursor for this sync — it only
+    // becomes the durable token once the type completes. Kept separate from
+    // pendingChangesToken so a resumed fallback doesn't mistake it for a cursor
+    // and skip the timestamp gap-fill.
+    var pendingCapturedToken: String? = null
 )
 
 @Serializable
@@ -325,6 +333,12 @@ class SyncManager(
         val recordCount: Int = 0,
         val nextCursor: Long? = null,
         val anchorTimestamp: Long? = null,
+        // Change-log cursor after this page (changes-mode reads only). Doubles as
+        // the "this page came from the change log" marker.
+        val nextChangesToken: String? = null,
+        // Token captured just before this fetch (full-export start or timestamp
+        // fallback); persisted as the type's pendingCapturedToken.
+        val capturedToken: String? = null,
         val isDone: Boolean = false
     )
 
@@ -354,6 +368,11 @@ class SyncManager(
     ): RoundRobinResult = coroutineScope {
         val olderThanCursors = mutableMapOf<String, Long?>()
         val anchorCursors = mutableMapOf<String, Long?>()
+        // Change-log read cursors (changes-mode incremental sync only).
+        val changesTokenCursors = mutableMapOf<String, String>()
+        // Tokens captured this sync to become the durable token at type completion
+        // (full-export bootstrap, or fallback after a missing/expired token).
+        val capturedTokens = mutableMapOf<String, String>()
         val completedTypes = mutableSetOf<String>()
 
         stateMutex.withLock {
@@ -364,6 +383,8 @@ class SyncManager(
                     if (!progress.isComplete) {
                         progress.pendingOlderThan?.let { olderThanCursors[id] = it }
                         progress.pendingAnchorTimestamp?.let { anchorCursors[id] = it }
+                        progress.pendingChangesToken?.let { changesTokenCursors[id] = it }
+                        progress.pendingCapturedToken?.let { capturedTokens[id] = it }
                     }
                 }
             }
@@ -383,6 +404,16 @@ class SyncManager(
                     anchorCursors[type] = anchor
                 }
             }
+            if (healthProvider.supportsChanges) {
+                val storedTokens = loadChangesTokens()
+                for (type in types) {
+                    // A type mid-fallback (capturedTokens) must finish its timestamp
+                    // gap-fill — don't hand it the stale stored token as a cursor.
+                    if (!completedTypes.contains(type) && !changesTokenCursors.containsKey(type) && !capturedTokens.containsKey(type)) {
+                        storedTokens[type]?.let { changesTokenCursors[type] = it }
+                    }
+                }
+            }
         }
 
         // Observed samples-per-parent for each type, learned from each full page and
@@ -395,6 +426,16 @@ class SyncManager(
         // overlapped with the previous round's upload. It never runs concurrently with
         // itself — the loop awaits the previous prefetch before starting the next — so
         // the cursor/completion/expansion maps stay single-writer.
+        // Captures the change-log position for a type at most once per sync (retried
+        // next round if the capture call failed). Must run BEFORE the accompanying
+        // read, so nothing written during the read falls between the token and the
+        // data. The token becomes durable only when the type completes.
+        suspend fun captureChangesTokenIfNeeded(type: String) {
+            if (healthProvider.supportsChanges && !capturedTokens.containsKey(type)) {
+                healthProvider.getChangesToken(type)?.let { capturedTokens[type] = it }
+            }
+        }
+
         suspend fun fetchRound(): RoundFetch? {
             val incompleteTypes = types.filter { !completedTypes.contains(it) }
             if (incompleteTypes.isEmpty()) return null
@@ -415,11 +456,27 @@ class SyncManager(
                 val pageLimit = (SyncDefaults.READ_TARGET_EXPANDED_ITEMS / expansion).toInt().coerceIn(1, MAX_PAGE_SIZE)
 
                 val fetchStart = System.nanoTime()
-                val result = if (fullExport) {
+                val fetched = if (fullExport) {
+                    // Capture the change-log position BEFORE the export reads it, so
+                    // records written while the export runs are covered by the token
+                    // afterwards (they may be missed by the newest-first paging).
+                    captureChangesTokenIfNeeded(type)
                     fetchOneChunkNewestFirst(type, olderThanCursors[type], pageLimit)
                 } else {
-                    fetchOneChunkIncremental(type, anchorCursors[type], pageLimit)
+                    val token = changesTokenCursors[type]
+                    token?.let { fetchOneChunkChanges(type, it) } ?: run {
+                        // No usable change-log cursor (first sync on this SDK version, or
+                        // the token expired): capture a fresh token FIRST, then gap-fill
+                        // from the timestamp anchor — anything written during the gap-fill
+                        // is covered by the new token, and the change log takes over next
+                        // sync.
+                        changesTokenCursors.remove(type)
+                        captureChangesTokenIfNeeded(type)
+                        fetchOneChunkIncremental(type, anchorCursors[type], pageLimit)
+                    }
                 }
+                // Attach the type's captured token (if any) so Phase 3 persists it.
+                val result = capturedTokens[type]?.let { fetched.copy(capturedToken = it) } ?: fetched
                 fetchMsByType[type] = (System.nanoTime() - fetchStart) / 1_000_000
 
                 roundResults.add(result)
@@ -428,6 +485,7 @@ class SyncManager(
                     completedTypes.add(type)
                 } else {
                     if (fullExport) olderThanCursors[type] = result.nextCursor
+                    else if (result.nextChangesToken != null) changesTokenCursors[type] = result.nextChangesToken
                     else anchorCursors[type] = result.nextCursor
                 }
 
@@ -435,8 +493,9 @@ class SyncManager(
                 // writes a series consistently, so the measured samples-per-parent is stable
                 // and the next page can jump straight to the right size (converges in one
                 // round, vs several with smoothing). Only full pages update it — the tail
-                // page is partial and its ratio would skew the estimate.
-                if (result.recordCount >= pageLimit && result.recordCount > 0) {
+                // page is partial and its ratio would skew the estimate. Changes pages are
+                // excluded: their size is the change log's, not pageLimit's.
+                if (result.nextChangesToken == null && result.recordCount >= pageLimit && result.recordCount > 0) {
                     observedExpansion[type] = result.count.toDouble() / result.recordCount
                 }
             }
@@ -463,7 +522,8 @@ class SyncManager(
             val mergedData = UnifiedHealthData(
                 records = roundResults.flatMap { it.data.records },
                 workouts = roundResults.flatMap { it.data.workouts },
-                sleep = roundResults.flatMap { it.data.sleep }
+                sleep = roundResults.flatMap { it.data.sleep },
+                deleted = roundResults.flatMap { it.data.deleted }
             )
 
             var uploadMs = 0L
@@ -509,7 +569,12 @@ class SyncManager(
             val persistStart = System.nanoTime()
             stateMutex.withLock {
                 for (result in roundResults) {
-                    updateInMemoryProgress(result.type, result.count, isComplete = result.isDone, anchorTimestamp = result.anchorTimestamp)
+                    updateInMemoryProgress(
+                        result.type, result.count, isComplete = result.isDone,
+                        anchorTimestamp = result.anchorTimestamp,
+                        changesToken = result.nextChangesToken,
+                        capturedToken = result.capturedToken
+                    )
                     if (fullExport && !result.isDone) {
                         inMemoryState?.typeProgress?.get(result.type)?.pendingOlderThan = result.nextCursor
                     }
@@ -554,6 +619,7 @@ class SyncManager(
             val results = types.map { type ->
                 TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
             }
+            if (state != null) saveCompletedChangesTokens(state)
             if (state?.fullExport == true) markFullExportDone()
             if (state != null) logger("Sync: complete ($sent items, ${state.completedTypes.size} types)")
             clearSyncSessionInternal()
@@ -606,6 +672,36 @@ class SyncManager(
         )
     }
 
+    /**
+     * Reads one change-log page for [type]. Returns `null` when the token has
+     * expired — the caller falls back to a timestamp read under a fresh token.
+     */
+    private suspend fun fetchOneChunkChanges(
+        type: String,
+        token: String
+    ): FetchResult? {
+        logger("  $type: querying changes...")
+
+        val result = healthProvider.readChanges(type, token)
+        if (result.tokenExpired) return null
+
+        val floor = syncStartTimestamp()
+        val floorIso = floor?.let { UnifiedTimestamp.fromEpochMs(it) }
+        var data = if (floorIso != null) result.data.filterSince(floorIso) else result.data
+        if (result.deletedIds.isNotEmpty()) {
+            data = data.copy(deleted = result.deletedIds.map { UnifiedDeleted(it, payloadTypeName(type)) })
+        }
+
+        val isDone = !result.hasMore
+        logger("  $type: changes ${data.totalCount} item(s) (${data.deleted.size} deletion(s)), hasMore=${result.hasMore} -> isDone=$isDone")
+
+        return FetchResult(
+            type = type, data = data, count = data.totalCount, recordCount = result.recordCount,
+            anchorTimestamp = result.maxTimestamp, nextChangesToken = result.nextToken,
+            isDone = isDone
+        )
+    }
+
     private suspend fun fetchOneChunkIncremental(
         type: String,
         anchor: Long?,
@@ -633,16 +729,44 @@ class SyncManager(
         )
     }
 
-    private fun updateInMemoryProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Boolean, anchorTimestamp: Long?) {
+    private fun updateInMemoryProgress(
+        typeIdentifier: String,
+        sentInChunk: Int,
+        isComplete: Boolean,
+        anchorTimestamp: Long?,
+        changesToken: String? = null,
+        capturedToken: String? = null
+    ) {
         val state = inMemoryState ?: return
         val progress = state.typeProgress.getOrPut(typeIdentifier) { TypeSyncProgress(typeIdentifier) }
         progress.sentCount += sentInChunk
         progress.isComplete = isComplete
-        if (anchorTimestamp != null) progress.pendingAnchorTimestamp = anchorTimestamp
+        // maxOf: a change-log page can deliver backfilled (old-timestamp) records;
+        // the anchor is the expiry-fallback floor and must never move backwards.
+        if (anchorTimestamp != null) {
+            progress.pendingAnchorTimestamp =
+                progress.pendingAnchorTimestamp?.let { maxOf(it, anchorTimestamp) } ?: anchorTimestamp
+        }
+        if (changesToken != null) progress.pendingChangesToken = changesToken
+        if (capturedToken != null) {
+            progress.pendingCapturedToken = capturedToken
+            // A capture supersedes any change-log cursor read before it: tokens are only
+            // captured when the change-log position is re-established (full-export start,
+            // bootstrap, or expiry fallback), so a leftover cursor — e.g. from changes
+            // pages read before the token expired mid-sync/on resume — is stale, and
+            // persisting it at completion would resurrect the dead token.
+            progress.pendingChangesToken = null
+        }
         state.totalSentCount += sentInChunk
         if (isComplete) {
             state.completedTypes.add(typeIdentifier)
             progress.pendingAnchorTimestamp?.let { saveAnchor(typeIdentifier, it) }
+            // Changes tokens are NOT persisted here: unlike anchors they roll on every
+            // type on every sync (getChanges always returns a fresh token), so per-type
+            // writes would rewrite the whole token map ~once per tracked type per sync.
+            // They're flushed in one batch when the sync completes; until then the
+            // resumable state file carries them, and a discarded session just re-reads
+            // the same change pages (deduped by server upsert).
         }
     }
 
@@ -659,15 +783,18 @@ class SyncManager(
         var records = data.records
         var workouts = data.workouts
         var sleep = data.sleep
-        while (records.isNotEmpty() || workouts.isNotEmpty() || sleep.isNotEmpty()) {
+        var deleted = data.deleted
+        while (records.isNotEmpty() || workouts.isNotEmpty() || sleep.isNotEmpty() || deleted.isNotEmpty()) {
             var budget = maxItems
             val rTake = minOf(budget, records.size); budget -= rTake
             val wTake = minOf(budget, workouts.size); budget -= wTake
-            val sTake = minOf(budget, sleep.size)
-            batches.add(UnifiedHealthData(records.take(rTake), workouts.take(wTake), sleep.take(sTake)))
+            val sTake = minOf(budget, sleep.size); budget -= sTake
+            val dTake = minOf(budget, deleted.size)
+            batches.add(UnifiedHealthData(records.take(rTake), workouts.take(wTake), sleep.take(sTake), deleted.take(dTake)))
             records = records.drop(rTake)
             workouts = workouts.drop(wTake)
             sleep = sleep.drop(sTake)
+            deleted = deleted.drop(dTake)
         }
         return batches
     }
@@ -685,6 +812,9 @@ class SyncManager(
         }
         if (data.workouts.isNotEmpty()) {
             typeCounts["workouts"] = data.workouts.size
+        }
+        if (data.deleted.isNotEmpty()) {
+            typeCounts["deleted"] = data.deleted.size
         }
 
         val totalCount = typeCounts.values.sum()
@@ -1125,16 +1255,45 @@ class SyncManager(
 
     private fun saveAnchor(type: String, timestamp: Long) {
         val current = loadAnchors().toMutableMap()
-        current[type] = timestamp
+        // The anchor floors the timestamp fallback after a token expiry; a change-log
+        // backfill carries old timestamps and must never regress it.
+        current[type] = current[type]?.let { maxOf(it, timestamp) } ?: timestamp
         syncPrefs.edit().putString(
             StorageKeys.KEY_ANCHORS,
             json.encodeToString(current.mapValues { it.value.toDouble() })
         ).apply()
     }
 
+    // MARK: - Changes Tokens (change-log cursors, one per type)
+
+    private fun loadChangesTokens(): Map<String, String> {
+        val jsonStr = syncPrefs.getString(StorageKeys.KEY_CHANGES_TOKENS, null) ?: return emptyMap()
+        return try {
+            json.decodeFromString<Map<String, String>>(jsonStr)
+        } catch (_: Exception) { emptyMap() }
+    }
+
+    /** Persists the rolled tokens of all completed types in one write (see the note
+     *  in [updateInMemoryProgress] for why this isn't done per type). */
+    private fun saveCompletedChangesTokens(state: SyncState) {
+        val tokens = mutableMapOf<String, String>()
+        for ((type, progress) in state.typeProgress) {
+            if (!progress.isComplete) continue
+            (progress.pendingChangesToken ?: progress.pendingCapturedToken)?.let { tokens[type] = it }
+        }
+        if (tokens.isEmpty()) return
+        val current = loadChangesTokens().toMutableMap()
+        current.putAll(tokens)
+        syncPrefs.edit().putString(
+            StorageKeys.KEY_CHANGES_TOKENS,
+            json.encodeToString(current)
+        ).apply()
+    }
+
     fun resetAnchors() {
         syncPrefs.edit()
             .remove(StorageKeys.KEY_ANCHORS)
+            .remove(StorageKeys.KEY_CHANGES_TOKENS)
             .putBoolean(fullDoneKey(), false)
             .apply()
         clearSyncSession()

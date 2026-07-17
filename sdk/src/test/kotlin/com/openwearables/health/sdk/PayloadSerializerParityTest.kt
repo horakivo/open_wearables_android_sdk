@@ -104,7 +104,12 @@ class PayloadSerializerParityTest {
             )
         )
 
-        return UnifiedHealthData(records = records, workouts = workouts, sleep = sleep)
+        val deleted = listOf(
+            UnifiedDeleted(id = "gone-1", type = "HEART_RATE"),
+            UnifiedDeleted(id = "gone-2", type = "SLEEP")
+        )
+
+        return UnifiedHealthData(records = records, workouts = workouts, sleep = sleep, deleted = deleted)
     }
 }
 

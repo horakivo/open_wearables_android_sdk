@@ -133,34 +133,58 @@ data class UnifiedSleep(
 }
 
 // ---------------------------------------------------------------------------
+// Deleted record tombstone (2 keys)
+// ---------------------------------------------------------------------------
+
+/**
+ * A record deleted at the provider since the last sync. The server is expected to
+ * remove the stored record with this [id] AND any records whose `parentId` equals
+ * [id] (series/session records are expanded client-side into children carrying the
+ * provider record's id as `parentId`).
+ */
+data class UnifiedDeleted(
+    val id: String,
+    val type: String
+) {
+    fun toMap(): Map<String, Any?> = mapOf(
+        "id" to id,
+        "type" to type
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Aggregated read result
 // ---------------------------------------------------------------------------
 
 data class UnifiedHealthData(
     val records: List<UnifiedRecord> = emptyList(),
     val workouts: List<UnifiedWorkout> = emptyList(),
-    val sleep: List<UnifiedSleep> = emptyList()
+    val sleep: List<UnifiedSleep> = emptyList(),
+    val deleted: List<UnifiedDeleted> = emptyList()
 ) {
     val isEmpty: Boolean
-        get() = records.isEmpty() && workouts.isEmpty() && sleep.isEmpty()
+        get() = records.isEmpty() && workouts.isEmpty() && sleep.isEmpty() && deleted.isEmpty()
 
     val totalCount: Int
-        get() = records.size + workouts.size + sleep.size
+        get() = records.size + workouts.size + sleep.size + deleted.size
 
     fun toDataMap(): Map<String, Any> = mapOf(
         "records" to records.map { it.toMap() },
         "workouts" to workouts.map { it.toMap() },
-        "sleep" to sleep.map { it.toMap() }
+        "sleep" to sleep.map { it.toMap() },
+        "deleted" to deleted.map { it.toMap() }
     )
 
     /**
      * Returns a copy with only records/workouts/sleep whose startDate >= [floorIso].
      * The ISO string comparison works because dates are in ISO-8601 format (lexicographic order).
+     * Deleted tombstones carry no timestamp and always pass through.
      */
     fun filterSince(floorIso: String): UnifiedHealthData = UnifiedHealthData(
         records = records.filter { it.startDate >= floorIso },
         workouts = workouts.filter { it.startDate >= floorIso },
         sleep = sleep.filter { it.startDate >= floorIso },
+        deleted = deleted,
     )
 }
 
@@ -173,6 +197,26 @@ data class ProviderReadResult(
     // is the correct unit for the "last page" check — comparing the expanded sample
     // count against the page size is a unit mismatch that breaks paging for series/
     // session types (e.g. sleep). 0 for empty/error reads, which reads as "last page".
+    val recordCount: Int = 0
+)
+
+/**
+ * One page of a provider's change log (Health Connect Changes API).
+ *
+ * When [tokenExpired] is true the provider's change log no longer covers
+ * [the requested token] — all other fields are empty and the caller must fall
+ * back to a timestamp-based read under a freshly captured token.
+ */
+data class ProviderChangesResult(
+    val data: UnifiedHealthData = UnifiedHealthData(),
+    /** Provider record ids deleted since the token position (parent record ids). */
+    val deletedIds: List<String> = emptyList(),
+    /** Token for the next page / next sync. `null` on error — keep the current token. */
+    val nextToken: String? = null,
+    val hasMore: Boolean = false,
+    val tokenExpired: Boolean = false,
+    val maxTimestamp: Long? = null,
+    /** Number of upserted parent records in this page. */
     val recordCount: Int = 0
 )
 
@@ -272,7 +316,15 @@ fun writeUnifiedPayload(
     sink.name("records"); sink.beginArray(); for (r in data.records) writeRecord(sink, r); sink.endArray()
     sink.name("workouts"); sink.beginArray(); for (w in data.workouts) writeWorkout(sink, w); sink.endArray()
     sink.name("sleep"); sink.beginArray(); for (s in data.sleep) writeSleep(sink, s); sink.endArray()
+    sink.name("deleted"); sink.beginArray(); for (d in data.deleted) writeDeleted(sink, d); sink.endArray()
     sink.endObject()
+    sink.endObject()
+}
+
+private fun writeDeleted(sink: JsonSink, d: UnifiedDeleted) {
+    sink.beginObject()
+    sink.name("id"); sink.value(d.id)
+    sink.name("type"); sink.value(d.type)
     sink.endObject()
 }
 

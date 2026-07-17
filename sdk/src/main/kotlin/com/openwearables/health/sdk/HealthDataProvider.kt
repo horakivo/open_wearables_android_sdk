@@ -75,4 +75,25 @@ interface HealthDataProvider {
         olderThanTimestamp: Long? = null,
         limit: Int = 1000
     ): ProviderReadResult = ProviderReadResult(UnifiedHealthData(), null, null)
+
+    /**
+     * `true` when the provider exposes a change log (Health Connect Changes API).
+     * When supported, incremental sync consumes [readChanges] instead of
+     * timestamp-filtered [readData], which also picks up backfilled, updated and
+     * deleted records that a data-timestamp anchor would miss.
+     */
+    val supportsChanges: Boolean get() = false
+
+    /**
+     * Capture a change-log token for [typeId] at the current position.
+     * Returns `null` on failure (caller keeps using timestamp reads).
+     */
+    suspend fun getChangesToken(typeId: String): String? = null
+
+    /**
+     * Read one page of changes for [typeId] from [changesToken].
+     * Only called when [supportsChanges] is true.
+     */
+    suspend fun readChanges(typeId: String, changesToken: String): ProviderChangesResult =
+        throw UnsupportedOperationException("Provider does not support the changes API")
 }
