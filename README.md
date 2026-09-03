@@ -19,8 +19,8 @@ Native Android SDK for reading and syncing health data from **Samsung Health** a
 
 | Category | Types |
 |----------|-------|
-| **Activity** | steps, distanceWalkingRunning, distanceCycling, flightsClimbed |
-| **Energy** | activeEnergy, basalEnergy |
+| **Activity** | steps, distanceWalkingRunning, flightsClimbed, elevationGained, speed, power, stepsCadence, cyclingCadence |
+| **Energy** | activeEnergy, basalEnergy, totalEnergy |
 | **Heart** | heartRate, restingHeartRate, heartRateVariabilitySDNN, vo2Max, oxygenSaturation |
 | **Respiratory** | respiratoryRate |
 | **Body** | bodyMass, height, bodyFatPercentage, leanBodyMass, bodyTemperature |

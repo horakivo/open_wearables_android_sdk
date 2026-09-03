@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.0
+
+* **Workout-associated sample types**: new Health Connect readers for `elevationGained` (`ElevationGainedRecord`), `totalEnergy` (`TotalCaloriesBurnedRecord`), `speed` (`SpeedRecord`), `power` (`PowerRecord`), `stepsCadence` (`StepsCadenceRecord`) and `cyclingCadence` (`CyclingPedalingCadenceRecord`). Series records (speed, power, both cadences) are expanded per sample under the parent record id with `parentId`, like heart rate, so tombstones cascade the same way. Wire types: `ELEVATION_GAINED`, `TOTAL_CALORIES_BURNED`, `SPEED`, `POWER`, `STEPS_CADENCE`, `CYCLING_PEDALING_CADENCE`; units `m`, `kcal`, `m/s`, `W`, `steps/min`, `rpm`.
+* **Fixed double-read of distance**: `distanceWalkingRunning` and `distanceCycling` both mapped to Health Connect's single `DistanceRecord`, so every distance record was read and sent twice (and tombstoned ambiguously). `distanceCycling` is now a HealthKit-only id and is ignored on Android; `distanceWalkingRunning` carries all Health Connect distance.
+
 ## 0.12.0
 
 * **Health Connect Changes API for incremental sync**: incremental syncs now consume Health Connect's change log (`getChangesToken`/`getChanges`, one token per tracked type) instead of filtering by record timestamps. This picks up backfilled history (e.g. a Garmin/Fitbit companion app landing hours-old data after the anchor had already passed it), record updates, and record deletions — all of which the previous timestamp anchor silently missed.

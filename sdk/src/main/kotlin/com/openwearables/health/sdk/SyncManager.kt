@@ -381,7 +381,8 @@ class SyncManager(
     // ~40 samples), which is exactly why they're only a seed.
     private fun seedExpansion(type: String): Double = when (type) {
         "sleep" -> SyncDefaults.SLEEP_STAGES_PER_SESSION_ESTIMATE.toDouble()
-        "heartRate" -> SyncDefaults.HEART_RATE_SAMPLES_PER_RECORD_ESTIMATE.toDouble()
+        "heartRate", "speed", "power", "stepsCadence", "cyclingCadence" ->
+            SyncDefaults.HEART_RATE_SAMPLES_PER_RECORD_ESTIMATE.toDouble()
         else -> 1.0
     }
 
@@ -1127,7 +1128,13 @@ class SyncManager(
         "bodyFatPercentage" -> "BODY_FAT"
         "leanBodyMass" -> "LEAN_BODY_MASS"
         "flightsClimbed" -> "FLOORS_CLIMBED"
-        "distanceWalkingRunning", "distanceCycling" -> "DISTANCE"
+        "distanceWalkingRunning" -> "DISTANCE"
+        "elevationGained" -> "ELEVATION_GAINED"
+        "totalEnergy" -> "TOTAL_CALORIES_BURNED"
+        "speed" -> "SPEED"
+        "power" -> "POWER"
+        "stepsCadence" -> "STEPS_CADENCE"
+        "cyclingCadence" -> "CYCLING_PEDALING_CADENCE"
         "water", "dietaryWater" -> "HYDRATION"
         "vo2Max" -> "VO2_MAX"
         "respiratoryRate" -> "RESPIRATORY_RATE"
