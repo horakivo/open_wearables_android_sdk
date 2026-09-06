@@ -295,6 +295,7 @@ class HealthConnectManager(
         "water", "dietaryWater" -> convertHydration(records.filterIsInstance<HydrationRecord>())
         "vo2Max" -> convertVo2Max(records.filterIsInstance<Vo2MaxRecord>())
         "respiratoryRate" -> convertRespiratoryRate(records.filterIsInstance<RespiratoryRateRecord>())
+        "skinTemperature" -> convertSkinTemperature(records.filterIsInstance<SkinTemperatureRecord>())
         "elevationGained" -> convertElevationGained(records.filterIsInstance<ElevationGainedRecord>())
         "totalEnergy" -> convertTotalCalories(records.filterIsInstance<TotalCaloriesBurnedRecord>())
         "speed" -> convertSpeed(records.filterIsInstance<SpeedRecord>())
@@ -337,6 +338,7 @@ class HealthConnectManager(
                 "water", "dietaryWater" -> readRecordType<HydrationRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertHydration(it) }
                 "vo2Max" -> readRecordType<Vo2MaxRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertVo2Max(it) }
                 "respiratoryRate" -> readRecordType<RespiratoryRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertRespiratoryRate(it) }
+                "skinTemperature" -> readRecordType<SkinTemperatureRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSkinTemperature(it) }
                 "elevationGained" -> readRecordType<ElevationGainedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertElevationGained(it) }
                 "totalEnergy" -> readRecordType<TotalCaloriesBurnedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertTotalCalories(it) }
                 "speed" -> readRecordType<SpeedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSpeed(it) }
@@ -431,6 +433,7 @@ class HealthConnectManager(
         is HydrationRecord -> record.endTime.toEpochMilli()
         is Vo2MaxRecord -> record.time.toEpochMilli()
         is RespiratoryRateRecord -> record.time.toEpochMilli()
+        is SkinTemperatureRecord -> record.endTime.toEpochMilli()
         is ExerciseSessionRecord -> record.endTime.toEpochMilli()
         is SleepSessionRecord -> record.endTime.toEpochMilli()
         else -> null
@@ -620,6 +623,27 @@ class HealthConnectManager(
                 mapOf("measurementLocation" to mapTempLocation(r.measurementLocation)) else null
             UnifiedRecord(r.metadata.id, "BODY_TEMPERATURE", iso, iso, zoneStr(r.zoneOffset),
                 buildSource(r.metadata), r.temperature.inCelsius, "°C", null, meta)
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    /**
+     * One record per night: the mean of the record's deltas from the device's own baseline, in °C.
+     * A delta stays a delta even when the device also reports the baseline — a relative series keeps
+     * every night on the same scale, which is what a per-user baseline needs.
+     */
+    private fun convertSkinTemperature(records: List<SkinTemperatureRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.mapNotNull { r ->
+            if (r.deltas.isEmpty()) return@mapNotNull null
+            val ts = r.endTime.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+            val meanDelta = r.deltas.map { it.delta.inCelsius }.average()
+            val meta = mutableMapOf<String, Any?>("relative" to true, "sampleCount" to r.deltas.size)
+            r.baseline?.let { meta["baselineCelsius"] = it.inCelsius }
+            if (r.measurementLocation != SkinTemperatureRecord.MEASUREMENT_LOCATION_UNKNOWN)
+                meta["measurementLocation"] = SkinTemperatureRecord.MEASUREMENT_LOCATION_INT_TO_STRING_MAP[r.measurementLocation]
+            UnifiedRecord(r.metadata.id, "SKIN_TEMPERATURE", instantToIso(r.startTime), instantToIso(r.endTime),
+                zoneStr(r.startZoneOffset), buildSource(r.metadata), meanDelta, "degC", null, meta)
         }
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
@@ -1134,6 +1158,7 @@ class HealthConnectManager(
         "water", "dietaryWater" -> HydrationRecord::class
         "vo2Max" -> Vo2MaxRecord::class
         "respiratoryRate" -> RespiratoryRateRecord::class
+        "skinTemperature" -> SkinTemperatureRecord::class
         // Workout-associated sample types (bound to sessions server-side by time window + app id).
         "elevationGained" -> ElevationGainedRecord::class
         "totalEnergy" -> TotalCaloriesBurnedRecord::class

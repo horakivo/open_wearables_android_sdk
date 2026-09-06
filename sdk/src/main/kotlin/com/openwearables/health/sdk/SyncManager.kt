@@ -1138,6 +1138,7 @@ class SyncManager(
         "water", "dietaryWater" -> "HYDRATION"
         "vo2Max" -> "VO2_MAX"
         "respiratoryRate" -> "RESPIRATORY_RATE"
+        "skinTemperature" -> "SKIN_TEMPERATURE"
         "workout" -> "WORKOUT"
         "sleep" -> "SLEEP"
         else -> trackedTypeId.uppercase()
