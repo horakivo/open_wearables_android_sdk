@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.1
+
+* **Partial health permissions**: granting some data types is enough. Sync uploads those types and the example shows Start Sync after that screen, without a second Authorize tap. The permission screen opens on the main thread. Opening it from the Health Connect callback thread makes Android cancel the request and report no grants. On Android 14+ data types are requested separately from background and history, and an instant empty platform result falls back to the Health Connect app screen. When every requested data type is already granted, the permission screen stays closed.
+* **Samsung steps and active calories revisit recent hours** (#42): hourly aggregates are not frozen. Each sync re-reads the last 48 hours, aligned to the local hour, so a watch batch that lands after the window was first read overwrites that hour. The read is one window, not a page that walks forward forever. Older rows that start mid-hour are not overwritten, because their timestamp is not on the hour.
+* **Samsung active calories** (#41): `activeEnergy` aggregates `TOTAL_ACTIVE_CALORIES_BURNED`. The old `TOTAL_CALORIES` name is not an ActivitySummary operation, and the lookup then used the first operation it found, which uploaded distance in meters as `ACTIVE_CALORIES_BURNED` kcal. A missing operation name now skips the type instead of substituting another metric. Already uploaded buckets stay wrong until anchors are cleared and the type is exported again.
+
 ## 0.13.0
 
 * **Optional mTLS client certificates** (#34, #16): the shared OkHttp client can present a client cert from the Android KeyChain (`pickClientCertificate` / `clearClientCertificate`) or a bundled `.p12` in assets. No cert configured = plain TLS, so existing backends keep working. The HTTP client reloads at runtime when the alias changes.
