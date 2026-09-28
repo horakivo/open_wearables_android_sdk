@@ -86,6 +86,19 @@ class SamsungHealthManager(
         }
     }
 
+    /** Keep only types whose Samsung Health read permission is actually granted. */
+    private fun retainGrantedTypes(granted: Set<Permission>) {
+        val kept = trackedTypeIds.filter { id ->
+            val dataType = mapToDataType(id) ?: return@filter false
+            Permission.of(dataType, AccessType.READ) in granted
+        }.toSet()
+        val skipped = trackedTypeIds.size - kept.size
+        trackedTypeIds = kept
+        if (skipped > 0) {
+            logger("Skipping $skipped Samsung Health type(s) the user did not grant")
+        }
+    }
+
     private fun collapseSamsungTypeIds(typeIds: List<String>): List<String> {
         val seen = HashSet<String>()
         val kept = ArrayList<String>()
@@ -283,11 +296,17 @@ class SamsungHealthManager(
         return withContext(dispatchers.main) {
             try {
                 val permissions = dataTypes.map { Permission.of(it, AccessType.READ) }.toSet()
+                val alreadyGranted = store.getGrantedPermissions(permissions)
+                if (alreadyGranted.containsAll(permissions)) {
+                    retainGrantedTypes(alreadyGranted)
+                    logger("All Samsung Health permissions already granted — skipping permission dialog")
+                    return@withContext trackedTypeIds.isNotEmpty()
+                }
                 logger("Requesting ${permissions.size} Samsung Health permissions...")
-                val granted = store.requestPermissions(permissions, act)
-                val allGranted = granted.size == permissions.size
-                logger(if (allGranted) "All permissions granted" else "Granted ${granted.size}/${permissions.size}")
-                allGranted
+                val granted = alreadyGranted + store.requestPermissions(permissions, act)
+                retainGrantedTypes(granted)
+                logger("Granted ${trackedTypeIds.size}/${permissions.size} Samsung Health type(s)")
+                trackedTypeIds.isNotEmpty()
             } catch (e: Exception) {
                 logger("Permission request failed: ${e.message}")
                 false
@@ -304,8 +323,7 @@ class SamsungHealthManager(
         limit: Int
     ): ProviderReadResult {
         val rawRecords = readRawData(typeId, sinceTimestamp, limit)
-        if (rawRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null)
-        return convertToUnified(typeId, filterImplausibleTimestamps(typeId, rawRecords))
+        return toProviderResult(typeId, rawRecords)
     }
 
     override suspend fun readDataDescending(
@@ -314,8 +332,34 @@ class SamsungHealthManager(
         limit: Int
     ): ProviderReadResult {
         val rawRecords = readRawDataDescending(typeId, olderThanTimestamp, limit)
-        if (rawRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
-        return convertToUnified(typeId, filterImplausibleTimestamps(typeId, rawRecords))
+        return toProviderResult(typeId, rawRecords)
+    }
+
+    /**
+     * Aggregate reads already return the whole window (the page limit does not
+     * apply). Mark them exhaustive so the sync loop does not ask for another
+     * page and re-read the same hours forever.
+     */
+    private fun toProviderResult(typeId: String, rawRecords: List<HealthDataRecord>): ProviderReadResult {
+        val aggregate = getAggregateConfig(typeId) != null
+        val records = if (aggregate) dedupeAggregateHours(rawRecords) else rawRecords
+        if (records.isEmpty()) {
+            return ProviderReadResult(UnifiedHealthData(), null, exhaustive = aggregate)
+        }
+        val converted = convertToUnified(typeId, filterImplausibleTimestamps(typeId, records))
+        return if (aggregate) converted.copy(exhaustive = true) else converted
+    }
+
+    private fun dedupeAggregateHours(records: List<HealthDataRecord>): List<HealthDataRecord> {
+        if (records.size < 2) return records
+        val byHour = LinkedHashMap<Long, HealthDataRecord>()
+        for (record in records) {
+            val previous = byHour[record.startTime]
+            if (previous == null || (record.endTime ?: 0L) >= (previous.endTime ?: 0L)) {
+                byHour[record.startTime] = record
+            }
+        }
+        return byHour.values.toList()
     }
 
     /**
@@ -421,7 +465,10 @@ class SamsungHealthManager(
 
     private fun getAggregateConfig(typeId: String): AggregateConfig? = when (typeId) {
         "steps" -> AggregateConfig(DataTypes.STEPS, "TOTAL", "TOTAL")
-        "activeEnergy" -> AggregateConfig(DataTypes.ACTIVITY_SUMMARY, "TOTAL_CALORIES", "TOTAL_CALORIES")
+        // fieldName is the local map key convertRecords reads. The Samsung
+        // operation is active calories. TOTAL_CALORIES is not an ActivitySummary
+        // operation, so the old lookup missed and a fallback uploaded distance as kcal.
+        "activeEnergy" -> AggregateConfig(DataTypes.ACTIVITY_SUMMARY, "TOTAL_CALORIES", "TOTAL_ACTIVE_CALORIES_BURNED")
         else -> null
     }
 
@@ -452,12 +499,12 @@ class SamsungHealthManager(
             val builder = builderGetter.invoke(aggregateOp) ?: return emptyList()
             val builderClass = builder.javaClass
 
-            val startTime = if (sinceTimestamp != null) {
-                LocalDateTime.ofInstant(Instant.ofEpochMilli(sinceTimestamp + 1), ZoneId.systemDefault())
-            } else {
-                LocalDateTime.now().minusDays(30)
-            }
+            val zone = ZoneId.systemDefault()
+            val startTime = SamsungAggregateWindow.windowStart(sinceTimestamp, LocalDateTime.now(), zone)
             val endTime = LocalDateTime.now()
+            if (sinceTimestamp != null) {
+                logger("[$typeId] re-reading aggregate hours from $startTime (48h lookback, hour aligned)")
+            }
             val timeFilter = LocalTimeFilter.of(startTime, endTime)
 
             var hasGrouping = false
@@ -519,12 +566,13 @@ class SamsungHealthManager(
             val builder = builderGetter.invoke(aggregateOp) ?: return emptyList()
             val builderClass = builder.javaClass
 
+            val zone = ZoneId.systemDefault()
             val endTime = if (olderThanTimestamp != null) {
-                LocalDateTime.ofInstant(Instant.ofEpochMilli(olderThanTimestamp), ZoneId.systemDefault())
+                LocalDateTime.ofInstant(Instant.ofEpochMilli(olderThanTimestamp), zone)
             } else {
                 LocalDateTime.now()
             }
-            val startTime = LocalDateTime.now().minusDays(30)
+            val startTime = SamsungAggregateWindow.windowStart(null, LocalDateTime.now(), zone)
             val timeFilter = LocalTimeFilter.of(startTime, endTime)
 
             var hasGrouping = false
@@ -583,14 +631,30 @@ class SamsungHealthManager(
         try {
             val allOps = dataType.javaClass.getMethod("getAllAggregateOperations").invoke(dataType)
             if (allOps is Collection<*> && allOps.isNotEmpty()) {
+                val names = ArrayList<String>()
                 for (op in allOps) {
-                    val name = try { op?.javaClass?.getMethod("getName")?.invoke(op)?.toString() } catch (_: Exception) { null }
+                    val name = aggregateOperationName(op)
+                    if (name != null) names.add(name)
                     if (name != null && name.equals(opName, ignoreCase = true)) return op
                 }
-                return allOps.first()
+                logger("[$typeId] Aggregate operation '$opName' not found. Available: ${names.joinToString()}")
+                return null
             }
         } catch (_: Exception) {}
 
+        logger("[$typeId] Aggregate operation '$opName' not found")
+        return null
+    }
+
+    /** Samsung exposes the operation id as `getOperationName()`, not `getName()`. */
+    private fun aggregateOperationName(op: Any?): String? {
+        if (op == null) return null
+        for (method in listOf("getOperationName", "getName")) {
+            try {
+                val value = op.javaClass.getMethod(method).invoke(op)?.toString()
+                if (!value.isNullOrBlank()) return value
+            } catch (_: Exception) {}
+        }
         return null
     }
 
@@ -623,11 +687,20 @@ class SamsungHealthManager(
 
             if (startMs == null || numericValue == null || numericValue == 0.0) return null
 
+            val zone = ZoneId.systemDefault()
+            val hourStart = SamsungAggregateWindow.floorToHour(startMs, zone)
+            val now = System.currentTimeMillis()
+            // The open hour can end on the next clock hour, which is still in
+            // the future. Clamping keeps that bucket instead of dropping it.
+            var end = endMs ?: hourStart
+            if (end > now) end = now
+            if (end < hourStart) end = hourStart
+
             return HealthDataRecord(
-                uid = UUID.randomUUID().toString(),
+                uid = "$typeId-$hourStart",
                 dataType = typeId.uppercase(),
-                startTime = startMs,
-                endTime = endMs ?: startMs,
+                startTime = hourStart,
+                endTime = end,
                 zoneOffset = null,
                 dataSource = RawDataSource(null, null),
                 device = DeviceInfo(

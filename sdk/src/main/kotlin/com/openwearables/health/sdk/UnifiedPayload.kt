@@ -170,6 +170,11 @@ data class ProviderReadResult(
     val minTimestamp: Long? = null,
     /** Health Connect rejected the read. Empty data here is not "no more records". */
     val quotaExceeded: Boolean = false,
+    /**
+     * The provider returned the whole requested window, not one page.
+     * The sync loop must not ask for the next page from the newest timestamp.
+     */
+    val exhaustive: Boolean = false,
 )
 
 // ---------------------------------------------------------------------------

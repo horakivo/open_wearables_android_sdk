@@ -737,7 +737,7 @@ class SyncManager(
         }
 
         val reachedFloor = floor != null && result.minTimestamp != null && result.minTimestamp <= floor
-        val isLastChunk = result.data.totalCount < limit || reachedFloor
+        val isLastChunk = result.exhaustive || result.data.totalCount < limit || reachedFloor
 
         val data = if (reachedFloor && floorIso != null) result.data.filterSince(floorIso) else result.data
 
@@ -858,7 +858,7 @@ class SyncManager(
         }
 
         val count = result.data.totalCount
-        val isLastChunk = count < limit
+        val isLastChunk = result.exhaustive || count < limit
 
         logger("  $type: $count samples")
 
