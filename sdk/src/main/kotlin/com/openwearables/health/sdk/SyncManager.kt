@@ -453,7 +453,9 @@ class SyncManager(
     // samples depending on the device.
     private fun seedExpansion(type: String): Double = when (type) {
         "sleep" -> SyncDefaults.SLEEP_STAGES_PER_SESSION_ESTIMATE.toDouble()
-        "heartRate" -> SyncDefaults.HEART_RATE_SAMPLES_PER_RECORD_ESTIMATE.toDouble()
+        "heartRate", "speed", "cyclingSpeed", "runningSpeed", "power", "cyclingPower", "runningPower",
+        "stepsCadence", "cyclingPedalingCadence", "cyclingCadence" ->
+            SyncDefaults.HEART_RATE_SAMPLES_PER_RECORD_ESTIMATE.toDouble()
         else -> 1.0
     }
 
@@ -1435,6 +1437,12 @@ class SyncManager(
         "leanBodyMass" -> "LEAN_BODY_MASS"
         "flightsClimbed" -> "FLOORS_CLIMBED"
         "distanceWalkingRunning", "distanceCycling" -> "DISTANCE"
+        "elevationGained" -> "ELEVATION_GAINED"
+        "totalCaloriesBurned", "totalEnergy" -> "TOTAL_CALORIES_BURNED"
+        "speed", "cyclingSpeed", "runningSpeed" -> "SPEED"
+        "power", "cyclingPower", "runningPower" -> "POWER"
+        "stepsCadence" -> "STEPS_CADENCE"
+        "cyclingPedalingCadence", "cyclingCadence" -> "CYCLING_PEDALING_CADENCE"
         "water", "dietaryWater" -> "HYDRATION"
         "vo2Max" -> "VO2_MAX"
         "respiratoryRate" -> "RESPIRATORY_RATE"

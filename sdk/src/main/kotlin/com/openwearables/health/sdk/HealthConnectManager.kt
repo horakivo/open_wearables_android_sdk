@@ -408,6 +408,8 @@ class HealthConnectManager(
                 "speed", "cyclingSpeed", "runningSpeed" -> readRecordType<SpeedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSpeed(it) }
                 "totalCaloriesBurned", "totalEnergy" -> readRecordType<TotalCaloriesBurnedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertTotalCalories(it) }
                 "cyclingPedalingCadence", "cyclingCadence" -> readRecordType<CyclingPedalingCadenceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertCyclingCadence(it) }
+                "elevationGained" -> readRecordType<ElevationGainedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertElevationGained(it) }
+                "stepsCadence" -> readRecordType<StepsCadenceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertStepsCadence(it) }
                 "workout" -> readWorkouts(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 "sleep" -> readSleep(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 else -> ProviderReadResult(UnifiedHealthData(), null, null)
@@ -551,6 +553,10 @@ class HealthConnectManager(
                 convertFiltered(typeId, records.filterIsInstance<TotalCaloriesBurnedRecord>()) { convertTotalCalories(it) }
             "cyclingPedalingCadence", "cyclingCadence" ->
                 convertFiltered(typeId, records.filterIsInstance<CyclingPedalingCadenceRecord>()) { convertCyclingCadence(it) }
+            "elevationGained" ->
+                convertFiltered(typeId, records.filterIsInstance<ElevationGainedRecord>()) { convertElevationGained(it) }
+            "stepsCadence" ->
+                convertFiltered(typeId, records.filterIsInstance<StepsCadenceRecord>()) { convertStepsCadence(it) }
             "workout" -> {
                 val sessions = records.filterIsInstance<ExerciseSessionRecord>()
                 val (plausible, _) = filterRecordsWithImplausibleTimestamps("workout", sessions)
@@ -648,6 +654,8 @@ class HealthConnectManager(
         is SpeedRecord -> record.startTime.toEpochMilli()
         is TotalCaloriesBurnedRecord -> record.startTime.toEpochMilli()
         is CyclingPedalingCadenceRecord -> record.startTime.toEpochMilli()
+        is ElevationGainedRecord -> record.startTime.toEpochMilli()
+        is StepsCadenceRecord -> record.startTime.toEpochMilli()
         is ExerciseSessionRecord -> record.startTime.toEpochMilli()
         is SleepSessionRecord -> record.startTime.toEpochMilli()
         else -> null
@@ -679,6 +687,8 @@ class HealthConnectManager(
         is SpeedRecord -> record.endTime.toEpochMilli()
         is TotalCaloriesBurnedRecord -> record.endTime.toEpochMilli()
         is CyclingPedalingCadenceRecord -> record.endTime.toEpochMilli()
+        is ElevationGainedRecord -> record.endTime.toEpochMilli()
+        is StepsCadenceRecord -> record.endTime.toEpochMilli()
         is ExerciseSessionRecord -> record.endTime.toEpochMilli()
         is SleepSessionRecord -> record.endTime.toEpochMilli()
         else -> null
@@ -1047,6 +1057,34 @@ class HealthConnectManager(
                 val iso = instantToIso(sample.time)
                 unified.add(UnifiedRecord("$parentId-c$idx", "CYCLING_PEDALING_CADENCE", iso, iso, zo, source,
                     sample.revolutionsPerMinute, "rpm", parentId, null))
+            }
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    private fun convertElevationGained(records: List<ElevationGainedRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.map { r ->
+            val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
+            UnifiedRecord(r.metadata.id, "ELEVATION_GAINED", instantToIso(r.startTime), instantToIso(r.endTime),
+                zoneStr(r.startZoneOffset), buildSource(r.metadata), r.elevation.inMeters, "m", null, null)
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    // StepsCadenceRecord carries per-instant samples, expanded per sample under the parent id.
+    private fun convertStepsCadence(records: List<StepsCadenceRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = mutableListOf<UnifiedRecord>()
+        for (r in records) {
+            val parentId = r.metadata.id
+            val source = buildSource(r.metadata)
+            val zo = zoneStr(r.startZoneOffset)
+            for ((idx, sample) in r.samples.withIndex()) {
+                val ts = sample.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+                val iso = instantToIso(sample.time)
+                unified.add(UnifiedRecord("$parentId-s$idx", "STEPS_CADENCE", iso, iso, zo, source,
+                    sample.rate, "steps/min", parentId, null))
             }
         }
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
@@ -1556,6 +1594,8 @@ class HealthConnectManager(
         "speed", "cyclingSpeed", "runningSpeed" -> SpeedRecord::class
         "totalCaloriesBurned", "totalEnergy" -> TotalCaloriesBurnedRecord::class
         "cyclingPedalingCadence", "cyclingCadence" -> CyclingPedalingCadenceRecord::class
+        "elevationGained" -> ElevationGainedRecord::class
+        "stepsCadence" -> StepsCadenceRecord::class
         "workout" -> ExerciseSessionRecord::class
         "sleep" -> SleepSessionRecord::class
         else -> null
