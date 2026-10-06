@@ -22,6 +22,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -374,9 +375,29 @@ class SyncManager(
                 }
             }
 
-            processTypesRoundRobin(
+            var roundRobin = processTypesRoundRobin(
                 trackedTypes, effectiveFullExport, endpoint, background,
             )
+
+            // Server-side data reset detected mid-run: cursors are already cleared
+            // (applyServerSyncGeneration ran resetAnchors), so re-drive once as a
+            // full export. A second reset within the same call is left for the next
+            // scheduled sync rather than looping here.
+            if (roundRobin.generationReset) {
+                logger("Sync: restarting as full export (server data reset)")
+                // resetAnchors bumped the epoch; this restart is a new run, not a stale one.
+                runEpoch = syncEpoch.get()
+                stateMutex.withLock {
+                    inMemoryState = SyncState(
+                        userKey = userKey(), fullExport = true,
+                        createdAt = System.currentTimeMillis()
+                    )
+                    persistStateToDisk()
+                }
+                fullSyncStartTime = System.currentTimeMillis()
+                roundRobin = processTypesRoundRobin(trackedTypes, true, endpoint, background)
+            }
+            roundRobin
             }
 
             if (effectiveFullExport && !result.completed) {
@@ -399,7 +420,14 @@ class SyncManager(
     // MARK: - Round-Robin Sync Orchestration (combined payloads)
 
     private data class TypeResult(val type: String, val success: Boolean, val recordCount: Int)
-    private data class RoundRobinResult(val completed: Boolean, val totalRecords: Int, val typeResults: List<TypeResult>)
+    private data class RoundRobinResult(
+        val completed: Boolean,
+        val totalRecords: Int,
+        val typeResults: List<TypeResult>,
+        // Set when the server's sync generation changed mid-run: local cursors were
+        // reset and the caller must restart the sync as a full export.
+        val generationReset: Boolean = false
+    )
 
     private data class FetchResult(
         val type: String,
@@ -613,6 +641,12 @@ class SyncManager(
                         break
                     }
                     logger("Round sent batch ${i + 1}/${batches.size}: ${batch.totalCount} items (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
+
+                    if (applyServerSyncGeneration(sendResult.syncGeneration)) {
+                        prefetched?.cancel()
+                        prefetched = null
+                        return@syncRound RoundRobinResult(false, 0, emptyList(), generationReset = true)
+                    }
                 }
 
                 if (failed != null) {
@@ -1217,7 +1251,14 @@ class SyncManager(
 
     // MARK: - Send with Auth Retry
 
-    private data class SendResult(val success: Boolean, val statusCode: Int?, val payloadSizeKb: Int)
+    private data class SendResult(
+        val success: Boolean,
+        val statusCode: Int?,
+        val payloadSizeKb: Int,
+        // Server's per-user sync generation echoed on successful uploads; null when
+        // the backend predates it or the body couldn't be parsed.
+        val syncGeneration: Long? = null
+    )
 
     private suspend fun sendPayload(endpoint: String, payload: Map<String, Any>): SendResult {
         val requestBytes = AtomicLong(0)
@@ -1297,9 +1338,11 @@ class SyncManager(
                 val response = httpClient.newCall(requestBuilder.build()).execute()
                 val sizeKb = ((requestBytes?.get() ?: 0L) / 1024).toInt()
                 val code = response.code
+                if (response.isSuccessful) {
+                    return@withContext SendResult(true, code, sizeKb, readSyncGeneration(response))
+                }
                 response.body?.close()
 
-                if (response.isSuccessful) return@withContext SendResult(true, code, sizeKb)
                 if (code == 401) {
                     logger("Got 401, refreshing token...")
                     val retryOk = handle401(endpoint, body, contentEncoding)
@@ -1312,6 +1355,17 @@ class SyncManager(
                 SendResult(false, null, 0)
             }
         }
+
+    /** Reads the server's per-user sync generation from a successful sync response.
+     *  Absent on older backends; null means "no signal", never "reset". Consumes
+     *  (and thereby closes) the response body. */
+    private fun readSyncGeneration(response: okhttp3.Response): Long? = try {
+        val text = response.body?.string()
+        if (text.isNullOrBlank()) null
+        else json.parseToJsonElement(text).jsonObject["sync_generation"]?.jsonPrimitive?.longOrNull
+    } catch (_: Exception) {
+        null
+    }
 
     private suspend fun handle401(endpoint: String, body: okhttp3.RequestBody, contentEncoding: String? = null): Boolean {
         if (secureStorage.isApiKeyAuth) {
@@ -1566,12 +1620,48 @@ class SyncManager(
                 syncPrefs.edit()
                     .remove(StorageKeys.KEY_ANCHORS)
                     .remove(StorageKeys.KEY_CHANGE_TOKENS)
+                    .remove(syncGenerationKey())
                     .putBoolean(fullDoneKey(), false)
                     .commit()
                 clearSyncSessionInternal()
             }
         }
         logger("Anchors reset - will perform full sync on next sync")
+    }
+
+    // MARK: - Sync Generation
+
+    // The server's per-user data generation, echoed on every sync response. It is
+    // bumped server-side when the user's synced data is deleted; a change means
+    // every local cursor points into a dataset that no longer exists, so the sync
+    // resets anchors and re-exports in full. Stored with the same lifecycle as the
+    // anchors it validates (cleared together in resetAnchors).
+    private fun syncGenerationKey(): String = "syncGeneration.${userKey()}"
+
+    private fun loadSyncGeneration(): Long? =
+        if (syncPrefs.contains(syncGenerationKey())) syncPrefs.getLong(syncGenerationKey(), 0L) else null
+
+    private fun saveSyncGeneration(value: Long) {
+        syncPrefs.edit().putLong(syncGenerationKey(), value).apply()
+    }
+
+    /** Applies a generation observed on an upload response. Returns true when the
+     *  generation changed (server data was reset): anchors are already cleared and
+     *  the caller must restart as a full export. A first-seen value is adopted
+     *  silently — "nothing stored" must never count as a mismatch, or every fresh
+     *  sign-in would trigger a second, redundant full export. */
+    private fun applyServerSyncGeneration(serverGeneration: Long?): Boolean {
+        if (serverGeneration == null) return false
+        val known = loadSyncGeneration()
+        if (known == null) {
+            saveSyncGeneration(serverGeneration)
+            return false
+        }
+        if (known == serverGeneration) return false
+        logger("Sync generation changed ($known -> $serverGeneration): server-side data was reset")
+        resetAnchors()
+        saveSyncGeneration(serverGeneration)
+        return true
     }
 
     private fun fullDoneKey(): String = "fullDone.${userKey()}"
