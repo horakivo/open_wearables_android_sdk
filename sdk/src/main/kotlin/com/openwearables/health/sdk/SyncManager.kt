@@ -27,6 +27,9 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.Buffer
+import okio.GzipSink
+import okio.buffer
 import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -346,9 +349,14 @@ class SyncManager(
             val syncStartTime = System.currentTimeMillis()
             val logsEndpoint = buildLogsEndpoint(host, userId)
 
+            val result = coroutineScope {
             if (effectiveFullExport) {
                 fullSyncStartTime = syncStartTime
                 currentLogsEndpoint = logsEndpoint
+                // Fire-and-forget: the round loop does not wait for telemetry (the request
+                // can take up to the client's read timeout) and the backend does not need
+                // the start event before the first batch.
+                launch {
                 try {
                     // Already-sent totals only. Paging the whole store here
                     // burns the Health Connect request quota before any payload
@@ -363,11 +371,13 @@ class SyncManager(
                 } catch (e: Exception) {
                     logger("Sync start log failed: ${e.message}")
                 }
+                }
             }
 
-            val result = processTypesRoundRobin(
+            processTypesRoundRobin(
                 trackedTypes, effectiveFullExport, endpoint, background,
             )
+            }
 
             if (effectiveFullExport && !result.completed) {
                 val durationMs = (System.currentTimeMillis() - syncStartTime).toInt()
@@ -395,12 +405,29 @@ class SyncManager(
         val type: String,
         val data: UnifiedHealthData = UnifiedHealthData(),
         val count: Int = 0,
+        // Parent records returned by this page (before expansion) and the page limit it was
+        // read with; a full page drives the observed-expansion estimate for the next one.
+        val recordCount: Int = 0,
+        val pageLimit: Int = 0,
         val nextCursor: Long? = null,
         val anchorTimestamp: Long? = null,
         val nextChangeToken: String? = null,
         val isDone: Boolean = false,
         val quotaExceeded: Boolean = false,
     )
+
+    // One round's fetched pages plus how long the read took (wall clock).
+    private data class RoundFetch(val results: List<FetchResult>, val fetchMs: Long)
+
+    // Initial guess for how many child records one parent expands into on convert. Used
+    // only for a type's FIRST foreground page; after that the page limit is sized from the
+    // observed expansion (see the round loop), because a HeartRateRecord may hold ~1 or ~40
+    // samples depending on the device.
+    private fun seedExpansion(type: String): Double = when (type) {
+        "sleep" -> SyncDefaults.SLEEP_STAGES_PER_SESSION_ESTIMATE.toDouble()
+        "heartRate" -> SyncDefaults.HEART_RATE_SAMPLES_PER_RECORD_ESTIMATE.toDouble()
+        else -> 1.0
+    }
 
     private suspend fun processTypesRoundRobin(
         types: List<String>,
@@ -448,11 +475,38 @@ class SyncManager(
             }
         }
 
-        var loggedPageSize = -1
+        // Observed samples-per-parent per type, learned from each full page and used to size
+        // the next foreground page. In-memory for this sync; reseeds on resume.
+        val observedExpansion = mutableMapOf<String, Double>()
+
+        // Page limit (in PARENT records) for each type. Background pages stay small and split
+        // evenly; foreground pages target READ_TARGET_EXPANDED_ITEMS expanded items per type,
+        // capped at the Health Connect page limit. Computed eagerly so a prefetch never reads
+        // observedExpansion while the loop updates it.
+        fun pageLimits(types: List<String>, smallPages: Boolean): Map<String, Int> {
+            if (smallPages) {
+                val perType = maxOf(1, SyncDefaults.BACKGROUND_CHUNK_SIZE / types.size)
+                return types.associateWith { perType }
+            }
+            return types.associateWith { type ->
+                val expansion = observedExpansion[type] ?: seedExpansion(type)
+                (SyncDefaults.READ_TARGET_EXPANDED_ITEMS / expansion).toInt().coerceIn(1, MAX_PAGE_SIZE)
+            }
+        }
+
+        suspend fun timedFetch(fetchTypes: List<String>, limits: Map<String, Int>): RoundFetch {
+            val started = System.nanoTime()
+            val results = fetchTypesForRound(
+                fetchTypes, fullExport, olderThanCursors, anchorCursors, changeTokens, limits,
+            )
+            return RoundFetch(results, (System.nanoTime() - started) / 1_000_000)
+        }
+
+        var loggedSmallPages: Boolean? = null
         return coroutineScope syncRound@{
         // Next page is read while the current one uploads. A failed upload
         // cancels it; cursors are persisted only after a 2xx.
-        var prefetched: Deferred<List<FetchResult>>? = null
+        var prefetched: Deferred<RoundFetch>? = null
         while (true) {
             val incompleteTypes = types.filter { !completedTypes.contains(it) }
             if (incompleteTypes.isEmpty()) break
@@ -462,19 +516,28 @@ class SyncManager(
             // 100-record page split across every type burns the limit on a handful
             // of samples.
             val smallPages = background && !isAppInForeground()
-            val chunkSize = if (smallPages) SyncDefaults.BACKGROUND_CHUNK_SIZE else SyncDefaults.CHUNK_SIZE
-            if (chunkSize != loggedPageSize) {
-                loggedPageSize = chunkSize
-                logger("Sync page size: $chunkSize${if (smallPages) " (app in background)" else ""}")
+            if (smallPages != loggedSmallPages) {
+                loggedSmallPages = smallPages
+                logger(
+                    if (smallPages) "Sync page size: ${SyncDefaults.BACKGROUND_CHUNK_SIZE} (app in background)"
+                    else "Sync page size: adaptive, ~${SyncDefaults.READ_TARGET_EXPANDED_ITEMS} items per type"
+                )
             }
-            val perTypeLimit = maxOf(1, chunkSize / incompleteTypes.size)
 
             // Phase 1: Fetch one chunk from each type (no network yet).
             // Health Connect reads are cross-process; do not wait on them one by one.
-            val roundResults = prefetched?.await() ?: fetchTypesForRound(
-                incompleteTypes, fullExport, olderThanCursors, anchorCursors, changeTokens, perTypeLimit,
-            )
+            val round = prefetched?.await() ?: timedFetch(incompleteTypes, pageLimits(incompleteTypes, smallPages))
             prefetched = null
+            val roundResults = round.results
+
+            // Learn the real expansion from a FULL page: a provider writes a series
+            // consistently, so the next page can jump straight to the right size. The tail
+            // page is partial and its ratio would skew the estimate.
+            for (result in roundResults) {
+                if (result.pageLimit > 0 && result.recordCount >= result.pageLimit) {
+                    observedExpansion[result.type] = result.count.toDouble() / result.recordCount
+                }
+            }
 
             for (result in roundResults) {
                 if (result.quotaExceeded) {
@@ -497,12 +560,8 @@ class SyncManager(
             // the next page; they are written to disk only after a 2xx.
             val stillIncomplete = types.filter { !completedTypes.contains(it) }
             if (!hitQuota && stillIncomplete.isNotEmpty()) {
-                val nextLimit = maxOf(1, chunkSize / stillIncomplete.size)
-                prefetched = async {
-                    fetchTypesForRound(
-                        stillIncomplete, fullExport, olderThanCursors, anchorCursors, changeTokens, nextLimit,
-                    )
-                }
+                val nextLimits = pageLimits(stillIncomplete, smallPages)
+                prefetched = async { timedFetch(stillIncomplete, nextLimits) }
             }
 
             // Phase 2: Merge all fetched data into one combined payload
@@ -512,17 +571,33 @@ class SyncManager(
                 sleep = roundResults.flatMap { it.data.sleep }
             )
 
+            var uploadMs = 0L
             if (!mergedData.isEmpty) {
-                logPayloadSummary(mergedData)
-                val uploadStarted = System.currentTimeMillis()
-                val sendResult = sendHealthData(endpoint, mergedData)
-                val uploadMs = System.currentTimeMillis() - uploadStarted
+                // A dense type's read page (heart rate) can expand well past CHUNK_SIZE, so
+                // the round is split into bounded sub-batches. Progress is committed only
+                // after every batch succeeds; a mid-round failure re-sends the whole round on
+                // resume, which the server absorbs by upserting on record id.
+                val batches = chunkUnifiedData(mergedData, SyncDefaults.CHUNK_SIZE)
+                var failed: SendResult? = null
+                var failedBatch = 0
+                for ((i, batch) in batches.withIndex()) {
+                    logPayloadSummary(batch)
+                    val uploadStarted = System.currentTimeMillis()
+                    val sendResult = sendHealthData(endpoint, batch)
+                    uploadMs += System.currentTimeMillis() - uploadStarted
+                    if (!sendResult.success) {
+                        failed = sendResult
+                        failedBatch = i + 1
+                        break
+                    }
+                    logger("Round sent batch ${i + 1}/${batches.size}: ${batch.totalCount} items (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
+                }
 
-                if (!sendResult.success) {
+                if (failed != null) {
                     prefetched?.cancel()
                     prefetched = null
-                    val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
-                    logger("Combined round failed ($reason)")
+                    val reason = failed.statusCode?.let { "HTTP $it" } ?: "network error"
+                    logger("Combined round failed on batch $failedBatch/${batches.size} ($reason)")
                     val (totalSent, typeResults) = stateMutex.withLock {
                         persistStateToDisk()
                         val state = inMemoryState
@@ -535,7 +610,7 @@ class SyncManager(
                     return@syncRound RoundRobinResult(false, totalSent, typeResults)
                 }
 
-                logger("Round sent: ${mergedData.totalCount} items (${sendResult.payloadSizeKb} KB) in ${uploadMs}ms -> ${sendResult.statusCode}")
+                logger("Round sent: ${mergedData.totalCount} items in ${batches.size} batch(es), ${uploadMs}ms")
             }
 
             // Phase 3: Update progress for all types in this round.
@@ -544,6 +619,7 @@ class SyncManager(
             // so the next incremental run cannot start from nil and re-crawl history.
             val newlyCompletedTypes = mutableListOf<Pair<String, Int>>()
             val deferCompleteForToken = fullExport && healthProvider.supportsChangeTracking()
+            val persistStart = System.nanoTime()
             stateMutex.withLock {
                 for (result in roundResults) {
                     val persistComplete = result.isDone && !deferCompleteForToken
@@ -566,6 +642,11 @@ class SyncManager(
                 }
                 persistStateToDisk()
             }
+            val persistMs = (System.nanoTime() - persistStart) / 1_000_000
+
+            // Per-round timing: read (Health Connect IPC + convert; from round 2 on it ran
+            // during the previous round's upload) vs upload vs persist.
+            logger("Round timing: read ${round.fetchMs}ms, upload ${uploadMs}ms, persist ${persistMs}ms (${mergedData.totalCount} items)")
 
             if (hitQuota) {
                 prefetched?.cancel()
@@ -689,12 +770,12 @@ class SyncManager(
         olderThanCursors: Map<String, Long?>,
         anchorCursors: Map<String, Long?>,
         changeTokens: Map<String, String?>,
-        perTypeLimit: Int,
+        limits: Map<String, Int>,
     ): List<FetchResult> {
         suspend fun fetch(type: String): FetchResult = if (fullExport) {
-            fetchOneChunkNewestFirst(type, olderThanCursors[type], perTypeLimit)
+            fetchOneChunkNewestFirst(type, olderThanCursors[type], limits.getValue(type))
         } else {
-            fetchOneChunkIncremental(type, anchorCursors[type], changeTokens[type], perTypeLimit)
+            fetchOneChunkIncremental(type, anchorCursors[type], changeTokens[type], limits.getValue(type))
         }
 
         if (!healthProvider.supportsParallelReads() || types.size <= 1) {
@@ -740,7 +821,7 @@ class SyncManager(
         }
 
         val reachedFloor = floor != null && result.minTimestamp != null && result.minTimestamp <= floor
-        val isLastChunk = result.exhaustive || result.data.totalCount < limit || reachedFloor
+        val isLastChunk = result.exhaustive || pageCount(result) < limit || reachedFloor
 
         val data = if (reachedFloor && floorIso != null) result.data.filterSince(floorIso) else result.data
 
@@ -756,6 +837,7 @@ class SyncManager(
 
         return FetchResult(
             type = type, data = data, count = data.totalCount,
+            recordCount = result.recordCount, pageLimit = limit,
             nextCursor = nextOlderThan, anchorTimestamp = anchorTs, isDone = isLastChunk
         )
     }
@@ -808,7 +890,7 @@ class SyncManager(
                 return FetchResult(type = type, quotaExceeded = true)
             }
             val count = result.data.totalCount
-            val isLastChunk = count < limit
+            val isLastChunk = pageCount(result) < limit
             if (result.data.isEmpty) {
                 logger("  $type: catch-up empty")
                 return FetchResult(type = type, nextChangeToken = realToken, isDone = true)
@@ -816,6 +898,7 @@ class SyncManager(
             logger("  $type: catch-up $count samples")
             return FetchResult(
                 type = type, data = result.data, count = count,
+                recordCount = result.recordCount, pageLimit = limit,
                 nextCursor = result.maxTimestamp,
                 anchorTimestamp = result.maxTimestamp,
                 nextChangeToken = if (isLastChunk) realToken else CATCHUP_TOKEN_PREFIX + realToken,
@@ -861,16 +944,23 @@ class SyncManager(
         }
 
         val count = result.data.totalCount
-        val isLastChunk = result.exhaustive || count < limit
+        val isLastChunk = result.exhaustive || pageCount(result) < limit
 
         logger("  $type: $count samples")
 
         return FetchResult(
             type = type, data = result.data, count = count,
+            recordCount = result.recordCount, pageLimit = limit,
             nextCursor = result.maxTimestamp, anchorTimestamp = result.maxTimestamp,
             isDone = isLastChunk
         )
     }
+
+    // Records that count against the read's pageSize: parent records when the provider
+    // reports them (a heart-rate series or sleep session expands into many samples/stages),
+    // otherwise the converted count.
+    private fun pageCount(result: ProviderReadResult): Int =
+        if (result.recordCount > 0) result.recordCount else result.data.totalCount
 
     private fun updateInMemoryProgress(
         typeIdentifier: String,
@@ -904,7 +994,11 @@ class SyncManager(
      */
     private fun encodeHealthPayload(data: UnifiedHealthData): ByteArray {
         val out = java.io.ByteArrayOutputStream(64 * 1024)
-        val writer = android.util.JsonWriter(java.io.OutputStreamWriter(out, Charsets.UTF_8))
+        // BufferedWriter is load-bearing: JsonWriter emits ~50 tiny writes per record and an
+        // unbuffered OutputStreamWriter allocates per call (GC pressure during upload).
+        val writer = android.util.JsonWriter(
+            java.io.BufferedWriter(java.io.OutputStreamWriter(out, Charsets.UTF_8), 32 * 1024)
+        )
         writer.beginObject()
         writer.name("provider").value(healthProvider.providerId)
         writer.name("sdkVersion").value(SyncDefaults.SDK_VERSION)
@@ -961,9 +1055,45 @@ class SyncManager(
     }
 
     private suspend fun sendHealthData(endpoint: String, data: UnifiedHealthData): SendResult {
-        val bytes = withContext(dispatchers.io) { encodeHealthPayload(data) }
+        val bytes = withContext(dispatchers.io) {
+            val raw = encodeHealthPayload(data)
+            val gzipped = gzip(raw)
+            val pct = if (raw.isNotEmpty()) 100L * gzipped.size / raw.size else 0
+            logger("Payload gzip: ${raw.size / 1024} KB -> ${gzipped.size / 1024} KB ($pct% of original)")
+            gzipped
+        }
         val body = bytes.toRequestBody("application/json".toMediaType())
-        return sendWithBody(endpoint, body, AtomicLong(bytes.size.toLong()))
+        return sendWithBody(endpoint, body, AtomicLong(bytes.size.toLong()), contentEncoding = "gzip")
+    }
+
+    private fun gzip(bytes: ByteArray): ByteArray {
+        val out = Buffer()
+        GzipSink(out).buffer().use { it.write(bytes) }
+        return out.readByteArray()
+    }
+
+    // Split a merged round into payloads of at most [maxItems] expanded items
+    // (records + workouts + sleep), so a large dense-series read page is uploaded as
+    // several bounded POSTs. Items keep their order; each batch fills records, then
+    // workouts, then sleep up to the budget.
+    private fun chunkUnifiedData(data: UnifiedHealthData, maxItems: Int): List<UnifiedHealthData> {
+        if (data.totalCount <= maxItems) return listOf(data)
+
+        val batches = mutableListOf<UnifiedHealthData>()
+        var records = data.records
+        var workouts = data.workouts
+        var sleep = data.sleep
+        while (records.isNotEmpty() || workouts.isNotEmpty() || sleep.isNotEmpty()) {
+            var budget = maxItems
+            val rTake = minOf(budget, records.size); budget -= rTake
+            val wTake = minOf(budget, workouts.size); budget -= wTake
+            val sTake = minOf(budget, sleep.size)
+            batches.add(UnifiedHealthData(records.take(rTake), workouts.take(wTake), sleep.take(sTake)))
+            records = records.drop(rTake)
+            workouts = workouts.drop(wTake)
+            sleep = sleep.drop(sTake)
+        }
+        return batches
     }
 
     // MARK: - Payload Summary Logging
@@ -1109,13 +1239,19 @@ class SyncManager(
         }
     }
 
-    private suspend fun sendWithBody(endpoint: String, body: okhttp3.RequestBody, requestBytes: AtomicLong? = null): SendResult =
+    private suspend fun sendWithBody(
+        endpoint: String,
+        body: okhttp3.RequestBody,
+        requestBytes: AtomicLong? = null,
+        contentEncoding: String? = null,
+    ): SendResult =
         withContext(dispatchers.io) {
             try {
                 val requestBuilder = Request.Builder()
                     .url(endpoint)
                     .post(body)
                     .header("Content-Type", "application/json")
+                contentEncoding?.let { requestBuilder.header("Content-Encoding", it) }
                 applyAuth(requestBuilder)
 
                 val response = httpClient.newCall(requestBuilder.build()).execute()
@@ -1126,7 +1262,7 @@ class SyncManager(
                 if (response.isSuccessful) return@withContext SendResult(true, code, sizeKb)
                 if (code == 401) {
                     logger("Got 401, refreshing token...")
-                    val retryOk = handle401(endpoint, body)
+                    val retryOk = handle401(endpoint, body, contentEncoding)
                     return@withContext SendResult(retryOk, if (retryOk) 200 else 401, sizeKb)
                 }
 
@@ -1137,7 +1273,7 @@ class SyncManager(
             }
         }
 
-    private suspend fun handle401(endpoint: String, body: okhttp3.RequestBody): Boolean {
+    private suspend fun handle401(endpoint: String, body: okhttp3.RequestBody, contentEncoding: String? = null): Boolean {
         if (secureStorage.isApiKeyAuth) {
             emitAuthError(401)
             return false
@@ -1153,6 +1289,7 @@ class SyncManager(
                             .url(endpoint)
                             .post(body)
                             .header("Content-Type", "application/json")
+                        contentEncoding?.let { retryBuilder.header("Content-Encoding", it) }
                         applyAuth(retryBuilder, newCredential)
 
                         val retryResponse = httpClient.newCall(retryBuilder.build()).execute()

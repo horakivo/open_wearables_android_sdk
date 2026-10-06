@@ -13,9 +13,27 @@ object ProviderDisplayNames {
 object SyncDefaults {
     const val SYNC_INTERVAL_MINUTES = 15L
     const val MIN_SYNC_INTERVAL_MINUTES = 15L
-    const val CHUNK_SIZE = 2000
+    // Upload batch (expanded items per POST). Sized so a typical round uploads as ONE
+    // POST — each extra batch costs a full server round-trip. 8000 items ≈ 3.4 MB JSON,
+    // ~300 KB gzipped on the wire.
+    const val CHUNK_SIZE = 8000
     /** Smaller pages in WorkManager / OEM background windows. */
     const val BACKGROUND_CHUNK_SIZE = 100
+
+    // Seeds for how many child records one parent expands into on convert, used only for
+    // a type's FIRST foreground page; after that the page is sized from the observed ratio.
+    // A sleep session expands into its stage records (often 50+ per night); a Health
+    // Connect HeartRateRecord is a series of ~25-40 samples on Wear-style providers.
+    const val SLEEP_STAGES_PER_SESSION_ESTIMATE = 50
+    const val HEART_RATE_SAMPLES_PER_RECORD_ESTIMATE = 40
+
+    // Target EXPANDED items (parents × samples-per-parent) to read per type per foreground
+    // round. A type's page size in PARENT records is this divided by its observed expansion,
+    // capped at the Health Connect page limit: a sparse provider (Garmin, ~1 sample per
+    // HeartRateRecord) reads up to MAX_PAGE_SIZE parents, a dense one ~hundreds — both
+    // yielding a similar-sized expanded page. Decoupled from CHUNK_SIZE: the round is
+    // re-chunked to CHUNK_SIZE by sub-batched upload. Tune against the "Round timing" logs.
+    const val READ_TARGET_EXPANDED_ITEMS = 8000
     /**
      * Wait before the next Health Connect read after a rate-limit.
      * An immediate retry spends the replenishing quota on the same queries.

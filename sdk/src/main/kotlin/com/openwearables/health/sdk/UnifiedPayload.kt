@@ -175,6 +175,11 @@ data class ProviderReadResult(
      * The sync loop must not ask for the next page from the newest timestamp.
      */
     val exhaustive: Boolean = false,
+    /**
+     * Parent records the provider returned for this page, before expansion into samples
+     * or stages — the unit `pageSize` bounds. 0 when the provider does not report it.
+     */
+    val recordCount: Int = 0,
 )
 
 // ---------------------------------------------------------------------------

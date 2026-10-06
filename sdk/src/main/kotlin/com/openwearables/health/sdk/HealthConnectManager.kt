@@ -590,14 +590,21 @@ class HealthConnectManager(
             pageSize = limit
         )
 
+        val readStart = System.nanoTime()
         val response = client.readRecords(request)
-        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
+        val readMs = (System.nanoTime() - readStart) / 1_000_000
+        if (response.records.isEmpty()) {
+            logger("  ${typeId}: readRecords IPC ${readMs}ms, 0 records")
+            return ProviderReadResult(UnifiedHealthData(), null, null)
+        }
 
         val (plausibleRecords, rejectedCount) = filterRecordsWithImplausibleTimestamps(typeId, response.records)
         if (plausibleRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
-        logger("Read ${plausibleRecords.size} ${T::class.simpleName} records${if (!ascending) " (newest first)" else ""}")
+        val convertStart = System.nanoTime()
         val result = convert(plausibleRecords)
+        val convertMs = (System.nanoTime() - convertStart) / 1_000_000
+        logger("  ${typeId}: pageSize=$limit, got ${response.records.size} ${T::class.simpleName}; readRecords IPC ${readMs}ms, convert ${convertMs}ms${if (!ascending) " (newest first)" else ""}")
 
         val minTs = if (!ascending && plausibleRecords.isNotEmpty()) {
             // Use startTime (minus 1ms) rather than endTime so the next
@@ -608,7 +615,7 @@ class HealthConnectManager(
             getRecordStartMillis(plausibleRecords.last())?.minus(1)
         } else null
 
-        return ProviderReadResult(result.data, result.maxTimestamp, minTs)
+        return ProviderReadResult(result.data, result.maxTimestamp, minTs, recordCount = response.records.size)
     }
 
     private fun getRecordStartMillis(record: Record): Long? = when (record) {
@@ -1081,6 +1088,7 @@ class HealthConnectManager(
                 TimeRangeFilter.before(Instant.now())
         }
 
+        val readStart = System.nanoTime()
         val response = client.readRecords(
             ReadRecordsRequest(
                 recordType = ExerciseSessionRecord::class,
@@ -1089,12 +1097,14 @@ class HealthConnectManager(
                 pageSize = limit
             )
         )
+        val readMs = (System.nanoTime() - readStart) / 1_000_000
+        logger("  workout: pageSize=$limit, got ${response.records.size} session(s); readRecords IPC ${readMs}ms")
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
         val (plausibleRecords, rejectedCount) = filterRecordsWithImplausibleTimestamps("workout", response.records)
         if (plausibleRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
-        return convertWorkoutRecords(client, plausibleRecords, ascending)
+        return convertWorkoutRecords(client, plausibleRecords, ascending).copy(recordCount = response.records.size)
     }
 
     private suspend fun convertWorkoutRecords(
@@ -1425,6 +1435,7 @@ class HealthConnectManager(
                 TimeRangeFilter.before(Instant.now())
         }
 
+        val readStart = System.nanoTime()
         val response = client.readRecords(
             ReadRecordsRequest(
                 recordType = SleepSessionRecord::class,
@@ -1433,12 +1444,15 @@ class HealthConnectManager(
                 pageSize = limit
             )
         )
+        val readMs = (System.nanoTime() - readStart) / 1_000_000
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
         val (plausibleRecords, rejectedCount) = filterRecordsWithImplausibleTimestamps("sleep", response.records)
         if (plausibleRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
-        return convertSleepRecords(plausibleRecords, ascending)
+        val result = convertSleepRecords(plausibleRecords, ascending)
+        logger("  sleep: pageSize=$limit, got ${response.records.size} session(s) -> ${result.data.sleep.size} stage record(s); readRecords IPC ${readMs}ms")
+        return result.copy(recordCount = response.records.size)
     }
 
     private fun convertSleepRecords(
