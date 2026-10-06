@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.15.0
+
+Fork release on top of upstream 0.13.1 (fork history up to 0.14.0 squashed and rebased).
+
+* **Sync performance**: adaptive foreground page size per type (`READ_TARGET_EXPANDED_ITEMS` divided by the observed samples-per-parent ratio, capped at Health Connect's 5000 page limit); paging stops on parent record count (`ProviderReadResult.recordCount`) instead of the expanded sample count; rounds are uploaded in sub-batches of at most `CHUNK_SIZE` (8000) items; gzip request compression (`Content-Encoding: gzip`, also on the 401 retry); buffered JSON writer; per-round timing logs. The full-export start log is fire-and-forget.
+* **Deletion propagation**: Health Connect `DeletionChange` entries are sent as a `deleted` array of `{id, type}` tombstones. The server deletes the record with that `id` and any records whose `parentId` equals it.
+* **Change token captured before the full export**, so the first incremental sync replays records written or deleted while the export ran.
+* **Server sync generation**: `sync_generation` from `/sync` responses is tracked per user; a change resets anchors and restarts as a full export.
+* **Workout sample types**: `elevationGained` and `stepsCadence` readers, in addition to upstream's power / speed / total calories / cycling cadence.
+* **Skin temperature** (`skinTemperature`, `SkinTemperatureRecord`): one record per night, the mean delta from the device baseline in °C.
+* **Linked workout metrics disabled**: `attachLinkedWorkoutMetrics` no longer runs extra Health Connect reads per workout; the samples sync as their own record types.
+* **Packaging**: the POM declares a real version (from `publishVersion`) for JitPack; `gradlew` is executable again.
+
 ## 0.13.1
 
 * **Partial health permissions**: granting some data types is enough. Sync uploads those types and the example shows Start Sync after that screen, without a second Authorize tap. The permission screen opens on the main thread. Opening it from the Health Connect callback thread makes Android cancel the request and report no grants. On Android 14+ data types are requested separately from background and history, and an instant empty platform result falls back to the Health Connect app screen. When every requested data type is already granted, the permission screen stays closed.

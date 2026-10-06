@@ -73,7 +73,7 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }
 
-val publishVersion = (findProperty("localPublishVersion") as String?) ?: "0.13.1"
+val publishVersion = (findProperty("localPublishVersion") as String?) ?: "0.15.0"
 
 // Top-level version so the generated POM declares a real `<version>` instead of
 // the default "unspecified" (which JitPack serves as `<version>-SNAPSHOT</version>`
