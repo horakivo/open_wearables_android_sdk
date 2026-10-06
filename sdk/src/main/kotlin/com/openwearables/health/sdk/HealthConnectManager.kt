@@ -455,25 +455,30 @@ class HealthConnectManager(
             try {
                 var current = token
                 var upserts = mutableListOf<Record>()
-                var deleted = 0
+                val deletedIds = mutableListOf<String>()
                 var hasMore: Boolean
                 do {
                     val response = hcClient.getChanges(current)
                     for (change in response.changes) {
                         when (change) {
                             is UpsertionChange -> upserts.add(change.record)
-                            is DeletionChange -> deleted++
+                            // Sent to the server as tombstones. An in-place update that
+                            // shrinks a series is not covered (no tombstone for the dropped
+                            // children); providers rewrite series via delete + insert.
+                            is DeletionChange -> deletedIds.add(change.recordId)
                         }
                     }
                     current = response.nextChangesToken
                     hasMore = response.hasMore
-                } while (hasMore && upserts.isEmpty())
+                } while (hasMore && upserts.isEmpty() && deletedIds.isEmpty())
+                val deleted = deletedIds.size
 
                 if (upserts.isEmpty()) {
                     return@withContext ChangeReadResult(
                         nextToken = current,
                         hasMore = hasMore,
                         deletedCount = deleted,
+                        deletedIds = deletedIds,
                     )
                 }
 
@@ -484,6 +489,7 @@ class HealthConnectManager(
                     hasMore = hasMore,
                     upsertCount = upserts.size,
                     deletedCount = deleted,
+                    deletedIds = deletedIds,
                 )
             } catch (e: SecurityException) {
                 logger("  $typeId: missing permission, skipping changes")

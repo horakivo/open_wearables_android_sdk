@@ -454,6 +454,27 @@ class SyncManager(
             }
         }
 
+        if (fullExport && healthProvider.supportsChangeTracking()) {
+            // Capture each type's change token BEFORE its first export page, so the first
+            // incremental sync replays everything written or deleted while the (possibly
+            // multi-hour) export ran. A token minted at type completion would skip those.
+            // A failed capture is retried by Phase 4 when the type completes.
+            var captured = false
+            for (type in types) {
+                if (completedTypes.contains(type) || changeTokens[type] != null) continue
+                if (!healthProvider.canTrackChanges(type)) continue
+                val token = healthProvider.mintChangeToken(type) ?: continue
+                changeTokens[type] = token
+                captured = true
+                stateMutex.withLock {
+                    inMemoryState?.let { state ->
+                        state.typeProgress.getOrPut(type) { TypeSyncProgress(type) }.pendingChangeToken = token
+                    }
+                }
+            }
+            if (captured) stateMutex.withLock { persistStateToDisk() }
+        }
+
         if (!fullExport) {
             val anchors = loadAnchors()
             val storedTokens = loadChangeTokens()
@@ -568,7 +589,8 @@ class SyncManager(
             val mergedData = UnifiedHealthData(
                 records = roundResults.flatMap { it.data.records },
                 workouts = roundResults.flatMap { it.data.workouts },
-                sleep = roundResults.flatMap { it.data.sleep }
+                sleep = roundResults.flatMap { it.data.sleep },
+                deleted = roundResults.flatMap { it.data.deleted }
             )
 
             var uploadMs = 0L
@@ -683,7 +705,7 @@ class SyncManager(
                         }
                         continue
                     }
-                    val minted = healthProvider.mintChangeToken(done.type)
+                    val minted = changeTokens[done.type] ?: healthProvider.mintChangeToken(done.type)
                     if (minted == null) {
                         prefetched?.cancel()
                         prefetched = null
@@ -914,16 +936,19 @@ class SyncManager(
         }
 
         val deletedNote = if (changes.deletedCount > 0) ", ${changes.deletedCount} deleted" else ""
-        if (changes.data.isEmpty) {
+        val pageData = if (changes.deletedIds.isEmpty()) changes.data else changes.data.copy(
+            deleted = changes.deletedIds.map { UnifiedDeleted(it, payloadTypeName(type)) }
+        )
+        if (pageData.isEmpty) {
             logger("  $type: no new data$deletedNote")
             return FetchResult(type = type, nextChangeToken = changes.nextToken ?: token, isDone = true)
         }
 
-        val count = changes.data.totalCount
+        val count = pageData.totalCount
         val isLastChunk = !changes.hasMore
         logger("  $type: $count samples$deletedNote")
         return FetchResult(
-            type = type, data = changes.data, count = count,
+            type = type, data = pageData, count = count,
             nextChangeToken = changes.nextToken ?: token,
             isDone = isLastChunk
         )
@@ -1013,6 +1038,15 @@ class SyncManager(
         writeValue(writer, data.workouts.map { it.toMap() })
         writer.name("sleep")
         writeValue(writer, data.sleep.map { it.toMap() })
+        writer.name("deleted")
+        writer.beginArray()
+        for (d in data.deleted) {
+            writer.beginObject()
+            writer.name("id").value(d.id)
+            writer.name("type").value(d.type)
+            writer.endObject()
+        }
+        writer.endArray()
         writer.endObject()
         writer.endObject()
         writer.flush()
@@ -1073,7 +1107,7 @@ class SyncManager(
     }
 
     // Split a merged round into payloads of at most [maxItems] expanded items
-    // (records + workouts + sleep), so a large dense-series read page is uploaded as
+    // (records + workouts + sleep + tombstones), so a large dense-series read page is uploaded as
     // several bounded POSTs. Items keep their order; each batch fills records, then
     // workouts, then sleep up to the budget.
     private fun chunkUnifiedData(data: UnifiedHealthData, maxItems: Int): List<UnifiedHealthData> {
@@ -1083,15 +1117,18 @@ class SyncManager(
         var records = data.records
         var workouts = data.workouts
         var sleep = data.sleep
-        while (records.isNotEmpty() || workouts.isNotEmpty() || sleep.isNotEmpty()) {
+        var deleted = data.deleted
+        while (records.isNotEmpty() || workouts.isNotEmpty() || sleep.isNotEmpty() || deleted.isNotEmpty()) {
             var budget = maxItems
             val rTake = minOf(budget, records.size); budget -= rTake
             val wTake = minOf(budget, workouts.size); budget -= wTake
-            val sTake = minOf(budget, sleep.size)
-            batches.add(UnifiedHealthData(records.take(rTake), workouts.take(wTake), sleep.take(sTake)))
+            val sTake = minOf(budget, sleep.size); budget -= sTake
+            val dTake = minOf(budget, deleted.size)
+            batches.add(UnifiedHealthData(records.take(rTake), workouts.take(wTake), sleep.take(sTake), deleted.take(dTake)))
             records = records.drop(rTake)
             workouts = workouts.drop(wTake)
             sleep = sleep.drop(sTake)
+            deleted = deleted.drop(dTake)
         }
         return batches
     }
@@ -1109,6 +1146,9 @@ class SyncManager(
         }
         if (data.workouts.isNotEmpty()) {
             typeCounts["workouts"] = data.workouts.size
+        }
+        if (data.deleted.isNotEmpty()) {
+            typeCounts["deleted"] = data.deleted.size
         }
 
         val totalCount = typeCounts.values.sum()

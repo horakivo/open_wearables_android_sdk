@@ -133,24 +133,46 @@ data class UnifiedSleep(
 }
 
 // ---------------------------------------------------------------------------
+// Deleted record tombstone (2 keys)
+// ---------------------------------------------------------------------------
+
+/**
+ * A record deleted at the provider since the last sync. The server is expected to
+ * remove the stored record with this [id] AND any records whose `parentId` equals
+ * [id] (series/session records are expanded client-side into children carrying the
+ * provider record's id as `parentId`).
+ */
+data class UnifiedDeleted(
+    val id: String,
+    val type: String
+) {
+    fun toMap(): Map<String, Any?> = mapOf(
+        "id" to id,
+        "type" to type
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Aggregated read result
 // ---------------------------------------------------------------------------
 
 data class UnifiedHealthData(
     val records: List<UnifiedRecord> = emptyList(),
     val workouts: List<UnifiedWorkout> = emptyList(),
-    val sleep: List<UnifiedSleep> = emptyList()
+    val sleep: List<UnifiedSleep> = emptyList(),
+    val deleted: List<UnifiedDeleted> = emptyList()
 ) {
     val isEmpty: Boolean
-        get() = records.isEmpty() && workouts.isEmpty() && sleep.isEmpty()
+        get() = records.isEmpty() && workouts.isEmpty() && sleep.isEmpty() && deleted.isEmpty()
 
     val totalCount: Int
-        get() = records.size + workouts.size + sleep.size
+        get() = records.size + workouts.size + sleep.size + deleted.size
 
     fun toDataMap(): Map<String, Any> = mapOf(
         "records" to records.map { it.toMap() },
         "workouts" to workouts.map { it.toMap() },
-        "sleep" to sleep.map { it.toMap() }
+        "sleep" to sleep.map { it.toMap() },
+        "deleted" to deleted.map { it.toMap() }
     )
 
     /**
@@ -161,6 +183,8 @@ data class UnifiedHealthData(
         records = records.filter { it.startDate >= floorIso },
         workouts = workouts.filter { it.startDate >= floorIso },
         sleep = sleep.filter { it.startDate >= floorIso },
+        // Tombstones carry no timestamp and always pass through.
+        deleted = deleted,
     )
 }
 

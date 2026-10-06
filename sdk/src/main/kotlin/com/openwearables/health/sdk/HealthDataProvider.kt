@@ -113,6 +113,8 @@ data class ChangeReadResult(
     val hasMore: Boolean = false,
     val upsertCount: Int = 0,
     val deletedCount: Int = 0,
+    /** Provider record ids deleted since the token position (parent record ids). */
+    val deletedIds: List<String> = emptyList(),
     val tokenExpired: Boolean = false,
 ) {
     companion object {
