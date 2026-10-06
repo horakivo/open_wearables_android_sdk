@@ -1183,7 +1183,8 @@ class HealthConnectManager(
         ascending: Boolean,
     ): ProviderReadResult {
         var maxTs: Long? = null
-        val sideQueryBudget = intArrayOf(WORKOUT_SIDE_QUERIES_PER_PAGE)
+        // Disabled with attachLinkedWorkoutMetrics below.
+        // val sideQueryBudget = intArrayOf(WORKOUT_SIDE_QUERIES_PER_PAGE)
         val workouts = plausibleRecords.map { r ->
             val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
             val source = buildSource(r.metadata)
@@ -1202,7 +1203,13 @@ class HealthConnectManager(
             // duration, so ``workout_details`` rows landed completely
             // empty for every HC-sourced workout. See Bug 1 in the
             // Peloton upstream issue for details.
-            attachLinkedWorkoutMetrics(client, r, values, sideQueryBudget)
+            //
+            // Disabled: Health Connect stores none of these aggregates on the session; they are
+            // derived from extra readRecords calls per workout (quota and time). The samples
+            // already sync as their own record types (heart rate, power, speed, distance, total
+            // calories, cadence), and the backend binds them to the workout by time window and
+            // source.
+            // attachLinkedWorkoutMetrics(client, r, values, sideQueryBudget)
 
             val segments = r.segments.map { seg ->
                 mapOf<String, Any?>(
