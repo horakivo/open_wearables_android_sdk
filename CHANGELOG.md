@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.1
+
+* **`syncNow()` restored**: upstream removed it; the fork keeps it because the React Native wrapper and the host app use it to sync and refresh data when the app opens. It runs an incremental sync and returns immediately when a sync is already running.
+
 ## 0.15.0
 
 Fork release on top of upstream 0.13.1 (fork history up to 0.14.0 squashed and rebased).
