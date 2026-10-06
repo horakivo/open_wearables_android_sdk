@@ -104,6 +104,9 @@ class SyncManager(
 
         private const val CATCHUP_TOKEN_PREFIX = "catchup:"
 
+        // Health Connect's ReadRecordsRequest.pageSize is capped at 5000.
+        const val MAX_PAGE_SIZE = 5000
+
         /** One sync per process. Workers construct their own [SyncManager]. */
         internal val processSyncLock = AtomicBoolean(false)
 

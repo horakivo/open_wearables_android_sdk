@@ -75,6 +75,11 @@ dependencies {
 
 val publishVersion = (findProperty("localPublishVersion") as String?) ?: "0.13.1"
 
+// Top-level version so the generated POM declares a real `<version>` instead of
+// the default "unspecified" (which JitPack serves as `<version>-SNAPSHOT</version>`
+// and Gradle then rejects with "inconsistent module metadata").
+version = publishVersion
+
 afterEvaluate {
     publishing {
         publications {
