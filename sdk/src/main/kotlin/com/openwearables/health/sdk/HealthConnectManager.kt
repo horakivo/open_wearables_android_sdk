@@ -410,6 +410,7 @@ class HealthConnectManager(
                 "cyclingPedalingCadence", "cyclingCadence" -> readRecordType<CyclingPedalingCadenceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertCyclingCadence(it) }
                 "elevationGained" -> readRecordType<ElevationGainedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertElevationGained(it) }
                 "stepsCadence" -> readRecordType<StepsCadenceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertStepsCadence(it) }
+                "skinTemperature" -> readRecordType<SkinTemperatureRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSkinTemperature(it) }
                 "workout" -> readWorkouts(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 "sleep" -> readSleep(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 else -> ProviderReadResult(UnifiedHealthData(), null, null)
@@ -557,6 +558,8 @@ class HealthConnectManager(
                 convertFiltered(typeId, records.filterIsInstance<ElevationGainedRecord>()) { convertElevationGained(it) }
             "stepsCadence" ->
                 convertFiltered(typeId, records.filterIsInstance<StepsCadenceRecord>()) { convertStepsCadence(it) }
+            "skinTemperature" ->
+                convertFiltered(typeId, records.filterIsInstance<SkinTemperatureRecord>()) { convertSkinTemperature(it) }
             "workout" -> {
                 val sessions = records.filterIsInstance<ExerciseSessionRecord>()
                 val (plausible, _) = filterRecordsWithImplausibleTimestamps("workout", sessions)
@@ -656,6 +659,7 @@ class HealthConnectManager(
         is CyclingPedalingCadenceRecord -> record.startTime.toEpochMilli()
         is ElevationGainedRecord -> record.startTime.toEpochMilli()
         is StepsCadenceRecord -> record.startTime.toEpochMilli()
+        is SkinTemperatureRecord -> record.startTime.toEpochMilli()
         is ExerciseSessionRecord -> record.startTime.toEpochMilli()
         is SleepSessionRecord -> record.startTime.toEpochMilli()
         else -> null
@@ -689,6 +693,7 @@ class HealthConnectManager(
         is CyclingPedalingCadenceRecord -> record.endTime.toEpochMilli()
         is ElevationGainedRecord -> record.endTime.toEpochMilli()
         is StepsCadenceRecord -> record.endTime.toEpochMilli()
+        is SkinTemperatureRecord -> record.endTime.toEpochMilli()
         is ExerciseSessionRecord -> record.endTime.toEpochMilli()
         is SleepSessionRecord -> record.endTime.toEpochMilli()
         else -> null
@@ -1068,6 +1073,27 @@ class HealthConnectManager(
             val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
             UnifiedRecord(r.metadata.id, "ELEVATION_GAINED", instantToIso(r.startTime), instantToIso(r.endTime),
                 zoneStr(r.startZoneOffset), buildSource(r.metadata), r.elevation.inMeters, "m", null, null)
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    /**
+     * One record per night: the mean of the record's deltas from the device's own baseline, in °C.
+     * A delta stays a delta even when the device also reports the baseline — a relative series keeps
+     * every night on the same scale, which is what a per-user baseline needs.
+     */
+    private fun convertSkinTemperature(records: List<SkinTemperatureRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.mapNotNull { r ->
+            if (r.deltas.isEmpty()) return@mapNotNull null
+            val ts = r.endTime.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+            val meanDelta = r.deltas.map { it.delta.inCelsius }.average()
+            val meta = mutableMapOf<String, Any?>("relative" to true, "sampleCount" to r.deltas.size)
+            r.baseline?.let { meta["baselineCelsius"] = it.inCelsius }
+            if (r.measurementLocation != SkinTemperatureRecord.MEASUREMENT_LOCATION_UNKNOWN)
+                meta["measurementLocation"] = SkinTemperatureRecord.MEASUREMENT_LOCATION_INT_TO_STRING_MAP[r.measurementLocation]
+            UnifiedRecord(r.metadata.id, "SKIN_TEMPERATURE", instantToIso(r.startTime), instantToIso(r.endTime),
+                zoneStr(r.startZoneOffset), buildSource(r.metadata), meanDelta, "degC", null, meta)
         }
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
@@ -1596,6 +1622,7 @@ class HealthConnectManager(
         "cyclingPedalingCadence", "cyclingCadence" -> CyclingPedalingCadenceRecord::class
         "elevationGained" -> ElevationGainedRecord::class
         "stepsCadence" -> StepsCadenceRecord::class
+        "skinTemperature" -> SkinTemperatureRecord::class
         "workout" -> ExerciseSessionRecord::class
         "sleep" -> SleepSessionRecord::class
         else -> null
