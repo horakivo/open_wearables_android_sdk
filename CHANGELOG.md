@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.15.2
+
+* **Initial export runs in the background worker again**: `startBackgroundSync()` enqueues the expedited WorkManager worker instead of running the first sync in the app process (upstream 0.13.0 change). The export runs as a foreground service with the sync notification, survives the app being closed, and `startBackgroundSync()` returns immediately instead of after the whole export.
+* **Unfinished export resumes in the worker**: `onForeground()` enqueues the worker instead of syncing in the app process, and only when no sync is running.
+* **Worker waits instead of skipping**: when an unfinished export is already running in the app process (e.g. the host app's `syncNow()`), the worker promotes itself to a foreground service and waits for it, keeping the process alive, then continues what is left. Finished exports still skip as before.
+
 ## 0.15.1
 
 * **`syncNow()` restored**: upstream removed it; the fork keeps it because the React Native wrapper and the host app use it to sync and refresh data when the app opens. It runs an incremental sync and returns immediately when a sync is already running.

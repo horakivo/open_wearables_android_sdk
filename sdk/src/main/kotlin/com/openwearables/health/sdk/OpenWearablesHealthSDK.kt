@@ -481,8 +481,13 @@ class OpenWearablesHealthSDK private constructor(
         logMessage("Background sync started (${getOrCreateProvider().providerName})")
         val sm = ensureSyncManager()
         sm.startBackgroundSync(h, customSyncUrl)
-        // Do not wait for WorkManager (OEM delay / OnePlus).
-        sm.syncNow(h, customSyncUrl, fullExport = false)
+        // Start the first sync now rather than waiting for the periodic job (OEM delay /
+        // OnePlus), but in the expedited worker instead of the app process: the worker runs
+        // as a foreground service with the sync notification and survives the app being
+        // closed, and this call returns immediately instead of after the whole export.
+        if (!SyncManager.processSyncLock.get()) {
+            sm.scheduleExpeditedSync(h, customSyncUrl)
+        }
     }
 
     suspend fun stopBackgroundSync() {
@@ -598,9 +603,13 @@ class OpenWearablesHealthSDK private constructor(
                 val sm = ensureSyncManager()
                 // Incomplete full export has no observer trigger; waiting for
                 // WorkManager on OEM skins drops it.
-                if (sm.hasResumableSyncSession() || !sm.hasCompletedInitialExport()) {
+                // Continued in the expedited worker (foreground service, survives the app
+                // being closed), not in the app process; nothing to do while a sync runs.
+                if ((sm.hasResumableSyncSession() || !sm.hasCompletedInitialExport()) &&
+                    !SyncManager.processSyncLock.get()
+                ) {
                     logMessage("Resuming sync after foreground...")
-                    host?.let { sm.syncNow(it, customSyncUrl, fullExport = false) }
+                    host?.let { sm.scheduleExpeditedSync(it, customSyncUrl) }
                 }
             }
         }

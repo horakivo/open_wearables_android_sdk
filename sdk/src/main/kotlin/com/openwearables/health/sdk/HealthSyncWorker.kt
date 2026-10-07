@@ -19,6 +19,8 @@ class HealthSyncWorker(
     companion object {
         const val KEY_HOST = "host"
         const val KEY_CUSTOM_SYNC_URL = "customSyncUrl"
+        private const val LOCK_POLL_MS = 2_000L
+        private const val LOCK_WAIT_MS = 30L * 60L * 1000L
     }
 
     override suspend fun doWork(): Result {
@@ -39,20 +41,9 @@ class HealthSyncWorker(
             return Result.success()
         }
 
-        if (SyncManager.processSyncLock.get()) {
-            android.util.Log.d("HealthSyncWorker", "Skipping — another sync is already running")
-            return Result.success()
-        }
-
         val host = inputData.getString(KEY_HOST) ?: secureStorage.getHost()
         if (host.isNullOrEmpty()) return Result.failure()
         val customSyncUrl = inputData.getString(KEY_CUSTOM_SYNC_URL) ?: secureStorage.getCustomSyncUrl()
-
-        try {
-            setForeground(getForegroundInfo())
-        } catch (e: Exception) {
-            android.util.Log.w("HealthSyncWorker", "Could not promote to foreground: ${e.message}")
-        }
 
         val dispatchers = DefaultDispatcherProvider()
         val provider = createProvider(applicationContext, secureStorage, dispatchers)
@@ -60,6 +51,34 @@ class HealthSyncWorker(
             applicationContext, secureStorage, provider, dispatchers,
             { android.util.Log.d("HealthSyncWorker", it) }
         )
+
+        val exportUnfinished = syncManager.hasResumableSyncSession() || !syncManager.hasCompletedInitialExport()
+        if (SyncManager.processSyncLock.get() && !exportUnfinished) {
+            android.util.Log.d("HealthSyncWorker", "Skipping — another sync is already running")
+            return Result.success()
+        }
+
+        try {
+            setForeground(getForegroundInfo())
+        } catch (e: Exception) {
+            android.util.Log.w("HealthSyncWorker", "Could not promote to foreground: ${e.message}")
+        }
+
+        // An unfinished export already running in the app process (e.g. the host app's
+        // syncNow on open) has no foreground service of its own. Wait for it as a
+        // foreground service instead of skipping: that keeps the process alive and the
+        // notification up while it finishes, and this run then continues whatever is left.
+        if (SyncManager.processSyncLock.get()) {
+            android.util.Log.d("HealthSyncWorker", "Waiting for the running sync to finish")
+            val waitUntil = System.currentTimeMillis() + LOCK_WAIT_MS
+            while (SyncManager.processSyncLock.get()) {
+                if (System.currentTimeMillis() > waitUntil) {
+                    android.util.Log.w("HealthSyncWorker", "Running sync did not finish in time — retrying later")
+                    return Result.retry()
+                }
+                kotlinx.coroutines.delay(LOCK_POLL_MS)
+            }
+        }
 
         return try {
             val trackedTypes = secureStorage.getTrackedTypes()
