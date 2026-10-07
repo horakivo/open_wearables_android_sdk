@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.3
+
+* **`getSyncStatus().isSyncing` sees the background worker's sync**: it reported the flag of the SDK's own `SyncManager` instance, while the worker runs the sync on a separate instance, so a sync running in the worker (the initial export since 0.15.2) read as not syncing. It now reports the process-wide sync lock.
+
 ## 0.15.2
 
 * **Initial export runs in the background worker again**: `startBackgroundSync()` enqueues the expedited WorkManager worker instead of running the first sync in the app process (upstream 0.13.0 change). The export runs as a foreground service with the sync notification, survives the app being closed, and `startBackgroundSync()` returns immediately instead of after the whole export.

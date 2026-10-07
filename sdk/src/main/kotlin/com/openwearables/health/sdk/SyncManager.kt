@@ -1724,6 +1724,8 @@ class SyncManager(
         try { syncStateFile().delete() } catch (_: Exception) {}
     }
 
+    // `isSyncing` reports the process-wide lock: the background worker runs the sync on its
+    // own SyncManager instance, so this instance's flag would read false during it.
     fun getSyncStatus(): Map<String, Any?> {
         val state = inMemoryState ?: loadSyncStateFromDisk()
         // Whether the initial full export (whole history) has ever completed for
@@ -1736,7 +1738,7 @@ class SyncManager(
                 "completedTypes" to state.completedTypes.size,
                 "isFullExport" to state.fullExport,
                 "initialExportDone" to initialExportDone,
-                "isSyncing" to isSyncing.get(),
+                "isSyncing" to processSyncLock.get(),
                 "createdAt" to dateFormatter.format(java.time.Instant.ofEpochMilli(state.createdAt))
             )
         } else {
@@ -1746,7 +1748,7 @@ class SyncManager(
                 "completedTypes" to 0,
                 "isFullExport" to false,
                 "initialExportDone" to initialExportDone,
-                "isSyncing" to isSyncing.get(),
+                "isSyncing" to processSyncLock.get(),
                 "createdAt" to null
             )
         }
