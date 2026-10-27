@@ -118,6 +118,14 @@ class OpenWearablesHealthSDK private constructor(
     // Configuration
     private var host: String? = null
     private var customSyncUrl: String? = null
+    private var endpoints: Endpoints? = null
+
+    /**
+     * What the sync plumbing carries as its host. With configured [Endpoints] there is
+     * no host, and an empty one stands in: [SyncEndpoints] does not read it then.
+     */
+    private val syncHost: String?
+        get() = host ?: if (endpoints != null || secureStorage.getEndpoints() != null) "" else null
 
     // Activity reference via WeakReference to prevent memory leaks
     private var activityRef: WeakReference<Activity>? = null
@@ -246,7 +254,9 @@ class OpenWearablesHealthSDK private constructor(
     fun configure(host: String, customSyncUrl: String? = null): Boolean {
         secureStorage.clearIfReinstalled()
         this.host = host
+        this.endpoints = null
         secureStorage.saveHost(host)
+        secureStorage.saveEndpoints(null)
 
         this.customSyncUrl = customSyncUrl ?: secureStorage.getCustomSyncUrl()
         this.customSyncUrl?.let { secureStorage.saveCustomSyncUrl(it) }
@@ -260,6 +270,36 @@ class OpenWearablesHealthSDK private constructor(
 
         logMessage("Configured: host=$host, provider=${provider.providerName}")
 
+        return restoreAfterConfigure(storedTypes)
+    }
+
+    /**
+     * Configure the SDK with the exact URLs it talks to; the SDK appends no path of its
+     * own. Replaces any host or customSyncUrl from `configure(host)`.
+     * @return true if background sync was previously active and should be auto-restored
+     */
+    fun configure(endpoints: Endpoints): Boolean {
+        secureStorage.clearIfReinstalled()
+        this.host = null
+        this.customSyncUrl = null
+        this.endpoints = endpoints
+        secureStorage.clearHost()
+        secureStorage.clearCustomSyncUrl()
+        secureStorage.saveEndpoints(endpoints)
+
+        val provider = getOrCreateProvider()
+        val storedTypes = secureStorage.getTrackedTypes()
+        if (storedTypes.isNotEmpty()) {
+            provider.setTrackedTypes(storedTypes)
+            logMessage("Restored ${storedTypes.size} tracked types for ${provider.providerName}")
+        }
+
+        logMessage("Configured: sync=${endpoints.sync}, logs=${endpoints.logs}, provider=${provider.providerName}")
+
+        return restoreAfterConfigure(storedTypes)
+    }
+
+    private fun restoreAfterConfigure(storedTypes: List<String>): Boolean {
         val isSyncActive = secureStorage.isSyncActive() && secureStorage.hasSession()
         if (isSyncActive && storedTypes.isNotEmpty()) {
             logMessage("Auto-restoring background sync...")
@@ -276,7 +316,7 @@ class OpenWearablesHealthSDK private constructor(
         val sm = ensureSyncManager()
         val clamped = maxOf(minutes, SyncDefaults.MIN_SYNC_INTERVAL_MINUTES)
         sm.syncIntervalMinutes = clamped
-        val h = host
+        val h = syncHost
         if (secureStorage.isSyncActive() && h != null) {
             sm.reschedulePeriodicSync(h, customSyncUrl)
         }
@@ -296,7 +336,7 @@ class OpenWearablesHealthSDK private constructor(
     }
 
     private suspend fun autoRestoreSync() {
-        val h = host
+        val h = syncHost
         if (h == null || secureStorage.getUserId() == null || !secureStorage.hasAuth) {
             logMessage("Cannot auto-restore: no session or host")
             return
@@ -333,6 +373,8 @@ class OpenWearablesHealthSDK private constructor(
         sm.resetAnchors()
 
         secureStorage.saveCredentials(userId, accessToken, refreshToken)
+        // Sign-out clears stored config; the worker reads endpoints from storage.
+        endpoints?.let { secureStorage.saveEndpoints(it) }
         if (apiKey != null) {
             secureStorage.saveApiKey(apiKey)
             logMessage("API key saved")
@@ -366,13 +408,16 @@ class OpenWearablesHealthSDK private constructor(
     private suspend fun notifyBackendOfDisconnect() {
         val userId = secureStorage.getUserId()
         val credential = secureStorage.authCredential
-        val base = secureStorage.apiBaseUrl
         val provider = activeProvider?.providerId ?: secureStorage.getProvider()
-        if (userId.isNullOrEmpty() || credential.isNullOrEmpty() || base.isNullOrEmpty() || provider.isNullOrEmpty()) {
+        if (userId.isNullOrEmpty() || credential.isNullOrEmpty() || provider.isNullOrEmpty()) {
             logMessage("Disconnect not sent - no session")
             return
         }
-        val url = SyncAuth.disconnectUrl(base, userId, provider)
+        val url = SyncEndpoints.disconnect(secureStorage.apiBaseUrl, userId, provider, secureStorage.getEndpoints())
+        if (url == null) {
+            logMessage("Disconnect not sent - no disconnect endpoint")
+            return
+        }
         withContext(dispatchers.io) {
             try {
                 val client = SyncManager.sharedHttpClient.newBuilder()
@@ -431,6 +476,8 @@ class OpenWearablesHealthSDK private constructor(
         "apiKey" to secureStorage.getApiKey(),
         "host" to secureStorage.getHost(),
         "customSyncUrl" to secureStorage.getCustomSyncUrl(),
+        "syncUrl" to secureStorage.getEndpoints()?.sync,
+        "logsUrl" to secureStorage.getEndpoints()?.logs,
         "isSyncActive" to secureStorage.isSyncActive(),
         "provider" to (activeProvider?.providerId ?: secureStorage.getProvider())
     )
@@ -469,7 +516,7 @@ class OpenWearablesHealthSDK private constructor(
      *   that many days ago (inclusive). When `null` (the default), syncs all available history.
      */
     suspend fun startBackgroundSync(syncDaysBack: Int? = null) {
-        val h = host ?: throw IllegalStateException("Not configured")
+        val h = syncHost ?: throw IllegalStateException("Not configured")
         if (!secureStorage.hasSession()) throw IllegalStateException("Not signed in")
 
         if (syncDaysBack != null) {
@@ -502,7 +549,7 @@ class OpenWearablesHealthSDK private constructor(
      * use it to sync and refresh data when the app opens.
      */
     suspend fun syncNow() {
-        val h = host ?: throw IllegalStateException("Host not configured")
+        val h = syncHost ?: throw IllegalStateException("Host not configured")
         ensureSyncManager().syncNow(h, customSyncUrl, fullExport = false)
     }
 
@@ -512,7 +559,7 @@ class OpenWearablesHealthSDK private constructor(
         sm.clearSyncSession()
         logMessage("Anchors reset")
 
-        val h = host
+        val h = syncHost
         if (secureStorage.isSyncActive() && secureStorage.hasAuth && h != null) {
             logMessage("Triggering full export after reset...")
             scope.launch {
@@ -534,7 +581,7 @@ class OpenWearablesHealthSDK private constructor(
     fun getSyncStatus(): Map<String, Any?> = ensureSyncManager().getSyncStatus()
 
     suspend fun resumeSync() {
-        val h = host ?: throw IllegalStateException("Host not configured")
+        val h = syncHost ?: throw IllegalStateException("Host not configured")
         val sm = ensureSyncManager()
         if (!sm.hasResumableSyncSession()) throw IllegalStateException("No resumable sync session")
         sm.syncNow(h, customSyncUrl, fullExport = false)
@@ -609,7 +656,7 @@ class OpenWearablesHealthSDK private constructor(
                     !SyncManager.processSyncLock.get()
                 ) {
                     logMessage("Resuming sync after foreground...")
-                    host?.let { sm.scheduleExpeditedSync(it, customSyncUrl) }
+                    syncHost?.let { sm.scheduleExpeditedSync(it, customSyncUrl) }
                 }
             }
         }
@@ -623,7 +670,7 @@ class OpenWearablesHealthSDK private constructor(
                 logMessage("Sync already running — not enqueueing another worker")
                 return
             }
-            host?.let { h ->
+            syncHost?.let { h ->
                 logMessage("Scheduling background sync...")
                 ensureSyncManager().scheduleExpeditedSync(h, customSyncUrl)
             }

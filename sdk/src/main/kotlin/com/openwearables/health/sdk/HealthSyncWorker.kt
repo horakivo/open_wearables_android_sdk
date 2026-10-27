@@ -41,8 +41,10 @@ class HealthSyncWorker(
             return Result.success()
         }
 
+        // With configured endpoints there is no host; SyncEndpoints ignores it then.
         val host = inputData.getString(KEY_HOST) ?: secureStorage.getHost()
-        if (host.isNullOrEmpty()) return Result.failure()
+            ?: if (secureStorage.getEndpoints() != null) "" else null
+        if (host == null || (host.isEmpty() && secureStorage.getEndpoints() == null)) return Result.failure()
         val customSyncUrl = inputData.getString(KEY_CUSTOM_SYNC_URL) ?: secureStorage.getCustomSyncUrl()
 
         val dispatchers = DefaultDispatcherProvider()

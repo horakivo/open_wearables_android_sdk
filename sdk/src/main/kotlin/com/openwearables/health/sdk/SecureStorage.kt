@@ -29,6 +29,10 @@ class SecureStorage(private val context: Context) {
 
         private const val KEY_HOST = "host"
         private const val KEY_CUSTOM_SYNC_URL = "customSyncUrl"
+        private const val KEY_ENDPOINT_SYNC = "endpointSync"
+        private const val KEY_ENDPOINT_LOGS = "endpointLogs"
+        private const val KEY_ENDPOINT_TOKEN_REFRESH = "endpointTokenRefresh"
+        private const val KEY_ENDPOINT_DISCONNECT = "endpointDisconnect"
         private const val KEY_SYNC_ACTIVE = "syncActive"
         private const val KEY_TRACKED_TYPES = "trackedTypes"
         private const val KEY_HEALTH_PROVIDER = "healthProvider"
@@ -176,10 +180,40 @@ class SecureStorage(private val context: Context) {
 
     fun getHost(): String? = configPrefs.getString(KEY_HOST, null)
 
+    fun clearHost() {
+        configPrefs.edit().remove(KEY_HOST).apply()
+    }
+
+    // MARK: - Endpoints (persisted so the background worker reaches the same server)
+
+    fun saveEndpoints(endpoints: Endpoints?) {
+        configPrefs.edit()
+            .putString(KEY_ENDPOINT_SYNC, endpoints?.sync)
+            .putString(KEY_ENDPOINT_LOGS, endpoints?.logs)
+            .putString(KEY_ENDPOINT_TOKEN_REFRESH, endpoints?.tokenRefresh)
+            .putString(KEY_ENDPOINT_DISCONNECT, endpoints?.disconnect)
+            .apply()
+    }
+
+    fun getEndpoints(): Endpoints? {
+        val sync = configPrefs.getString(KEY_ENDPOINT_SYNC, null) ?: return null
+        val logs = configPrefs.getString(KEY_ENDPOINT_LOGS, null) ?: return null
+        return Endpoints(
+            sync = sync,
+            logs = logs,
+            tokenRefresh = configPrefs.getString(KEY_ENDPOINT_TOKEN_REFRESH, null),
+            disconnect = configPrefs.getString(KEY_ENDPOINT_DISCONNECT, null),
+        )
+    }
+
     // MARK: - Custom Sync URL
 
     fun saveCustomSyncUrl(url: String) {
         configPrefs.edit().putString(KEY_CUSTOM_SYNC_URL, url).apply()
+    }
+
+    fun clearCustomSyncUrl() {
+        configPrefs.edit().remove(KEY_CUSTOM_SYNC_URL).apply()
     }
 
     fun getCustomSyncUrl(): String? = configPrefs.getString(KEY_CUSTOM_SYNC_URL, null)

@@ -315,7 +315,7 @@ class SyncManager(
                 return
             }
 
-            val endpoint = buildSyncEndpoint(host, customSyncUrl, userId)
+            val endpoint = SyncEndpoints.sync(host, customSyncUrl, userId, secureStorage.getEndpoints())
 
             val trackedTypes = healthProvider.getTrackedTypes().toList()
             if (trackedTypes.isEmpty()) {
@@ -348,7 +348,7 @@ class SyncManager(
             }
 
             val syncStartTime = System.currentTimeMillis()
-            val logsEndpoint = buildLogsEndpoint(host, userId)
+            val logsEndpoint = SyncEndpoints.logs(host, userId, secureStorage.getEndpoints())
 
             val result = coroutineScope {
             if (effectiveFullExport) {
@@ -1205,13 +1205,12 @@ class SyncManager(
         tokenRefreshLock.withLock { isRefreshingToken = true }
         try {
             val refreshToken = secureStorage.getRefreshToken()
-            val apiBaseUrl = secureStorage.apiBaseUrl
-            if (refreshToken == null || apiBaseUrl == null) {
+            val url = SyncEndpoints.tokenRefresh(secureStorage.apiBaseUrl, secureStorage.getEndpoints())
+            if (refreshToken == null || url == null) {
                 logger("Token refresh: missing credentials")
                 return@withContext TokenRefreshResult.AUTH_FAILURE
             }
 
-            val url = "$apiBaseUrl/token/refresh"
             val bodyMap = mapOf("refresh_token" to refreshToken)
             val body = json.encodeToString(bodyMap)
             val request = Request.Builder()
@@ -1452,11 +1451,6 @@ class SyncManager(
         else -> trackedTypeId.uppercase()
     }
 
-    private fun buildLogsEndpoint(host: String, userId: String): String {
-        val h = if (host.endsWith("/")) host.dropLast(1) else host
-        return "$h/api/v1/sdk/users/$userId/logs"
-    }
-
     private fun collectDeviceState(): Map<String, Any> {
         val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
@@ -1569,22 +1563,6 @@ class SyncManager(
         } catch (e: Exception) {
             logger("Sync log error: ${e.message}")
         }
-    }
-
-    // MARK: - Sync Endpoint
-
-    private fun buildSyncEndpoint(host: String, customSyncUrl: String?, userId: String): String {
-        if (customSyncUrl != null) {
-            if (customSyncUrl.contains("{user_id}") || customSyncUrl.contains("{userId}")) {
-                return customSyncUrl
-                    .replace("{userId}", userId)
-                    .replace("{user_id}", userId)
-            }
-            val normalizedBase = customSyncUrl.trimEnd('/')
-            return "$normalizedBase/sdk/users/$userId/sync"
-        }
-        val h = if (host.endsWith("/")) host.dropLast(1) else host
-        return "$h/api/v1/sdk/users/$userId/sync"
     }
 
     // MARK: - Anchors
