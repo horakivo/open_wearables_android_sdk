@@ -146,9 +146,16 @@ val sdk = OpenWearablesHealthSDK.getInstance()
 ### Configure
 
 ```kotlin
+// Every URL the SDK calls; `{user_id}` (and `{provider}` in `disconnect`) are filled in.
+// `tokenRefresh` and `disconnect` are optional; without them the SDK does not refresh
+// tokens (API-key sign-in) and sign-out skips the server-side disconnect.
 sdk.configure(
-    host = "https://api.example.com",
-    customSyncUrl = null  // optional: override the sync endpoint
+    Endpoints(
+        sync = "https://api.example.com/api/v1/sdk/users/{user_id}/sync",
+        logs = "https://api.example.com/api/v1/sdk/users/{user_id}/logs",
+        tokenRefresh = "https://api.example.com/api/v1/token/refresh",
+        disconnect = "https://api.example.com/api/v1/users/{user_id}/connections/{provider}",
+    )
 )
 ```
 
@@ -296,7 +303,7 @@ sdk.destroy()
 
 ### Sync Endpoint
 
-Data is POSTed to `{host}/api/v1/sdk/users/{userId}/sync` (or `customSyncUrl` if configured) as JSON:
+Data is POSTed to the configured `sync` endpoint as JSON:
 
 ```json
 {

@@ -27,8 +27,6 @@ class SecureStorage(private val context: Context) {
         private const val KEY_USER_ID = "userId"
         private const val KEY_API_KEY = "apiKey"
 
-        private const val KEY_HOST = "host"
-        private const val KEY_CUSTOM_SYNC_URL = "customSyncUrl"
         private const val KEY_ENDPOINT_SYNC = "endpointSync"
         private const val KEY_ENDPOINT_LOGS = "endpointLogs"
         private const val KEY_ENDPOINT_TOKEN_REFRESH = "endpointTokenRefresh"
@@ -172,18 +170,6 @@ class SecureStorage(private val context: Context) {
         return getRefreshToken() != null
     }
 
-    // MARK: - Host (not sensitive, stored in config prefs)
-
-    fun saveHost(host: String) {
-        configPrefs.edit().putString(KEY_HOST, host).apply()
-    }
-
-    fun getHost(): String? = configPrefs.getString(KEY_HOST, null)
-
-    fun clearHost() {
-        configPrefs.edit().remove(KEY_HOST).apply()
-    }
-
     // MARK: - Endpoints (persisted so the background worker reaches the same server)
 
     fun saveEndpoints(endpoints: Endpoints?) {
@@ -205,18 +191,6 @@ class SecureStorage(private val context: Context) {
             disconnect = configPrefs.getString(KEY_ENDPOINT_DISCONNECT, null),
         )
     }
-
-    // MARK: - Custom Sync URL
-
-    fun saveCustomSyncUrl(url: String) {
-        configPrefs.edit().putString(KEY_CUSTOM_SYNC_URL, url).apply()
-    }
-
-    fun clearCustomSyncUrl() {
-        configPrefs.edit().remove(KEY_CUSTOM_SYNC_URL).apply()
-    }
-
-    fun getCustomSyncUrl(): String? = configPrefs.getString(KEY_CUSTOM_SYNC_URL, null)
 
     // MARK: - Sync Active State
 
@@ -285,15 +259,6 @@ class SecureStorage(private val context: Context) {
 
     fun getNotificationText(): String = configPrefs.getString(KEY_NOTIFICATION_TEXT, null)
         ?: NotificationConfig.DEFAULT_TEXT
-
-    // MARK: - API Base URL (derived from host)
-
-    val apiBaseUrl: String?
-        get() {
-            val host = getHost() ?: return null
-            val h = if (host.endsWith("/")) host.dropLast(1) else host
-            return "$h/api/v1"
-        }
 
     // MARK: - Clear
 

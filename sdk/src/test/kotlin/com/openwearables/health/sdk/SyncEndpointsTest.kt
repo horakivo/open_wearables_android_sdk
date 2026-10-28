@@ -13,20 +13,13 @@ class SyncEndpointsTest {
 
     @Test
     fun configuredEndpointsAreUsedAsGiven() {
-        assertEquals(
-            "https://api.example.com/sync/sdk/users/u1/sync",
-            SyncEndpoints.sync("", null, "u1", endpoints),
-        )
-        assertEquals(
-            "https://api.example.com/sync/sdk/users/u1/logs",
-            SyncEndpoints.logs("", "u1", endpoints),
-        )
+        assertEquals("https://api.example.com/sync/sdk/users/u1/sync", SyncEndpoints.sync(endpoints, "u1"))
+        assertEquals("https://api.example.com/sync/sdk/users/u1/logs", SyncEndpoints.logs(endpoints, "u1"))
     }
 
     @Test
-    fun omittedRefreshAndDisconnectStayOff() {
-        assertNull(SyncEndpoints.tokenRefresh("https://api.example.com/api/v1", endpoints))
-        assertNull(SyncEndpoints.disconnect("https://api.example.com/api/v1", "u1", "google", endpoints))
+    fun omittedDisconnectStaysOff() {
+        assertNull(SyncEndpoints.disconnect(endpoints, "u1", "google"))
     }
 
     @Test
@@ -34,35 +27,16 @@ class SyncEndpointsTest {
         val withDisconnect = endpoints.copy(disconnect = "https://api.example.com/users/{user_id}/{provider}")
         assertEquals(
             "https://api.example.com/users/u1/samsung",
-            SyncEndpoints.disconnect(null, "u1", "samsung", withDisconnect),
+            SyncEndpoints.disconnect(withDisconnect, "u1", "samsung"),
         )
     }
 
     @Test
-    fun withoutEndpointsUrlsDeriveFromTheHost() {
+    fun relativeEndpointIsRejected() {
+        assertNull(SyncEndpoints.firstInvalid(endpoints))
         assertEquals(
-            "https://api.example.com/api/v1/sdk/users/u1/sync",
-            SyncEndpoints.sync("https://api.example.com/", null, "u1", null),
-        )
-        assertEquals(
-            "https://api.example.com/api/v1/sdk/users/u1/logs",
-            SyncEndpoints.logs("https://api.example.com/", "u1", null),
-        )
-        assertEquals(
-            "https://api.example.com/api/v1/token/refresh",
-            SyncEndpoints.tokenRefresh("https://api.example.com/api/v1", null),
-        )
-    }
-
-    @Test
-    fun customSyncUrlStillAppliesInHostMode() {
-        assertEquals(
-            "https://ingest.example.com/sdk/users/u1/sync",
-            SyncEndpoints.sync("https://api.example.com", "https://ingest.example.com/", "u1", null),
-        )
-        assertEquals(
-            "https://ingest.example.com/u/u1",
-            SyncEndpoints.sync("https://api.example.com", "https://ingest.example.com/u/{user_id}", "u1", null),
+            "logs" to "/sync/sdk/users/{user_id}/logs",
+            SyncEndpoints.firstInvalid(endpoints.copy(logs = "/sync/sdk/users/{user_id}/logs")),
         )
     }
 }
