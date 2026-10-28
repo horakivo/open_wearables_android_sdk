@@ -437,10 +437,10 @@ class OpenWearablesHealthSDK private constructor(
         "accessToken" to secureStorage.getAccessToken(),
         "refreshToken" to secureStorage.getRefreshToken(),
         "apiKey" to secureStorage.getApiKey(),
-        "syncUrl" to secureStorage.getEndpoints()?.sync,
-        "logsUrl" to secureStorage.getEndpoints()?.logs,
-        "tokenRefreshUrl" to secureStorage.getEndpoints()?.tokenRefresh,
-        "disconnectUrl" to secureStorage.getEndpoints()?.disconnect,
+        "syncURL" to secureStorage.getEndpoints()?.sync,
+        "logsURL" to secureStorage.getEndpoints()?.logs,
+        "tokenRefreshURL" to secureStorage.getEndpoints()?.tokenRefresh,
+        "disconnectURL" to secureStorage.getEndpoints()?.disconnect,
         "isSyncActive" to secureStorage.isSyncActive(),
         "provider" to (activeProvider?.providerId ?: secureStorage.getProvider())
     )
