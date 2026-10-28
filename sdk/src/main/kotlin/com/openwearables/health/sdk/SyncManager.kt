@@ -217,8 +217,8 @@ class SyncManager(
 
     // MARK: - Background Sync
 
-    suspend fun startBackgroundSync(host: String, customSyncUrl: String?): Boolean {
-        schedulePeriodicSync(host, customSyncUrl, replace = false)
+    suspend fun startBackgroundSync(): Boolean {
+        schedulePeriodicSync(replace = false)
         return true
     }
 
@@ -226,7 +226,7 @@ class SyncManager(
      * @param replace `true` when the interval changed. Default `KEEP` so
      * `configure` / app restart does not reset the 15-minute timer (#20).
      */
-    private fun schedulePeriodicSync(host: String, customSyncUrl: String?, replace: Boolean = false) {
+    private fun schedulePeriodicSync(replace: Boolean = false) {
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
@@ -235,10 +235,6 @@ class SyncManager(
             syncIntervalMinutes, TimeUnit.MINUTES
         )
             .setConstraints(constraints)
-            .setInputData(workDataOf(
-                HealthSyncWorker.KEY_HOST to host,
-                HealthSyncWorker.KEY_CUSTOM_SYNC_URL to customSyncUrl
-            ))
             .build()
 
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
@@ -249,25 +245,17 @@ class SyncManager(
         logger("Scheduled periodic sync every $syncIntervalMinutes minute(s)")
     }
 
-    fun reschedulePeriodicSync(host: String, customSyncUrl: String?) {
-        schedulePeriodicSync(host, customSyncUrl, replace = true)
+    fun reschedulePeriodicSync() {
+        schedulePeriodicSync(replace = true)
     }
 
-    fun scheduleExpeditedSync(
-        host: String,
-        customSyncUrl: String?,
-        initialDelayMs: Long = 0L,
-    ) {
+    fun scheduleExpeditedSync(initialDelayMs: Long = 0L) {
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
 
         val builder = OneTimeWorkRequestBuilder<HealthSyncWorker>()
             .setConstraints(constraints)
-            .setInputData(workDataOf(
-                HealthSyncWorker.KEY_HOST to host,
-                HealthSyncWorker.KEY_CUSTOM_SYNC_URL to customSyncUrl
-            ))
         if (initialDelayMs > 0L) {
             builder.setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
         } else {
@@ -295,8 +283,6 @@ class SyncManager(
     // MARK: - Sync Now
 
     suspend fun syncNow(
-        host: String,
-        customSyncUrl: String?,
         fullExport: Boolean,
         background: Boolean = false,
     ) {
@@ -315,7 +301,12 @@ class SyncManager(
                 return
             }
 
-            val endpoint = buildSyncEndpoint(host, customSyncUrl, userId)
+            val endpoints = secureStorage.getEndpoints()
+            if (endpoints == null) {
+                logger("No endpoints for sync - call configure")
+                return
+            }
+            val endpoint = SyncEndpoints.sync(endpoints, userId)
 
             val trackedTypes = healthProvider.getTrackedTypes().toList()
             if (trackedTypes.isEmpty()) {
@@ -348,7 +339,7 @@ class SyncManager(
             }
 
             val syncStartTime = System.currentTimeMillis()
-            val logsEndpoint = buildLogsEndpoint(host, userId)
+            val logsEndpoint = SyncEndpoints.logs(endpoints, userId)
 
             val result = coroutineScope {
             if (effectiveFullExport) {
@@ -1205,13 +1196,12 @@ class SyncManager(
         tokenRefreshLock.withLock { isRefreshingToken = true }
         try {
             val refreshToken = secureStorage.getRefreshToken()
-            val apiBaseUrl = secureStorage.apiBaseUrl
-            if (refreshToken == null || apiBaseUrl == null) {
+            val url = secureStorage.getEndpoints()?.tokenRefresh
+            if (refreshToken == null || url == null) {
                 logger("Token refresh: missing credentials")
                 return@withContext TokenRefreshResult.AUTH_FAILURE
             }
 
-            val url = "$apiBaseUrl/token/refresh"
             val bodyMap = mapOf("refresh_token" to refreshToken)
             val body = json.encodeToString(bodyMap)
             val request = Request.Builder()
@@ -1452,11 +1442,6 @@ class SyncManager(
         else -> trackedTypeId.uppercase()
     }
 
-    private fun buildLogsEndpoint(host: String, userId: String): String {
-        val h = if (host.endsWith("/")) host.dropLast(1) else host
-        return "$h/api/v1/sdk/users/$userId/logs"
-    }
-
     private fun collectDeviceState(): Map<String, Any> {
         val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
@@ -1569,22 +1554,6 @@ class SyncManager(
         } catch (e: Exception) {
             logger("Sync log error: ${e.message}")
         }
-    }
-
-    // MARK: - Sync Endpoint
-
-    private fun buildSyncEndpoint(host: String, customSyncUrl: String?, userId: String): String {
-        if (customSyncUrl != null) {
-            if (customSyncUrl.contains("{user_id}") || customSyncUrl.contains("{userId}")) {
-                return customSyncUrl
-                    .replace("{userId}", userId)
-                    .replace("{user_id}", userId)
-            }
-            val normalizedBase = customSyncUrl.trimEnd('/')
-            return "$normalizedBase/sdk/users/$userId/sync"
-        }
-        val h = if (host.endsWith("/")) host.dropLast(1) else host
-        return "$h/api/v1/sdk/users/$userId/sync"
     }
 
     // MARK: - Anchors

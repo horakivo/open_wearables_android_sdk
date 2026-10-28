@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+* **Breaking: `configure(endpoints)` replaces `configure(host, customSyncUrl)`**: the host app passes the exact sync, logs and (optional) token-refresh and disconnect URLs; `{user_id}` (and `{provider}` in `disconnect`) are the only substitutions and the SDK adds no path of its own. Without `tokenRefresh` the SDK does not refresh tokens (API-key sign-in); without `disconnect` sign-out skips the server call. `configure` throws `IllegalArgumentException` when an endpoint is not an absolute http(s) URL. The endpoints are persisted for the background worker, which skips syncing until the app has called `configure` once after upgrading.
+
 ## 0.15.3
 
 * **`getSyncStatus().isSyncing` sees the background worker's sync**: it reported the flag of the SDK's own `SyncManager` instance, while the worker runs the sync on a separate instance, so a sync running in the worker (the initial export since 0.15.2) read as not syncing. It now reports the process-wide sync lock.

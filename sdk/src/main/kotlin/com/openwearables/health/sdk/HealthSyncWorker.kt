@@ -17,8 +17,6 @@ class HealthSyncWorker(
 ) : CoroutineWorker(context, params) {
 
     companion object {
-        const val KEY_HOST = "host"
-        const val KEY_CUSTOM_SYNC_URL = "customSyncUrl"
         private const val LOCK_POLL_MS = 2_000L
         private const val LOCK_WAIT_MS = 30L * 60L * 1000L
     }
@@ -41,9 +39,7 @@ class HealthSyncWorker(
             return Result.success()
         }
 
-        val host = inputData.getString(KEY_HOST) ?: secureStorage.getHost()
-        if (host.isNullOrEmpty()) return Result.failure()
-        val customSyncUrl = inputData.getString(KEY_CUSTOM_SYNC_URL) ?: secureStorage.getCustomSyncUrl()
+        if (secureStorage.getEndpoints() == null) return Result.failure()
 
         val dispatchers = DefaultDispatcherProvider()
         val provider = createProvider(applicationContext, secureStorage, dispatchers)
@@ -89,15 +85,13 @@ class HealthSyncWorker(
             }
 
             android.util.Log.d("HealthSyncWorker", "Background sync (provider: ${provider.providerId})")
-            syncManager.syncNow(host, customSyncUrl, fullExport = false, background = true)
+            syncManager.syncNow(fullExport = false, background = true)
 
             val hitQuota = SyncManager.quotaBackoffPending.getAndSet(false)
             if (hitQuota) {
-                syncManager.scheduleExpeditedSync(
-                    host, customSyncUrl, initialDelayMs = SyncDefaults.QUOTA_BACKOFF_MS,
-                )
+                syncManager.scheduleExpeditedSync(initialDelayMs = SyncDefaults.QUOTA_BACKOFF_MS)
             } else if (syncManager.hasResumableSyncSession() || !syncManager.hasCompletedInitialExport()) {
-                syncManager.scheduleExpeditedSync(host, customSyncUrl)
+                syncManager.scheduleExpeditedSync()
             }
 
             Result.success()
