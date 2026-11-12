@@ -16,6 +16,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -2035,6 +2037,7 @@ class SyncManager(
         val initialExportDone = hasCompletedInitialSync()
         val pausedTypes = secureStorage.getPausedTypes().keys.toList()
         val resyncingTypes = actionablePendingResyncs()
+        val syncState = if (processSyncLock.get()) "running" else expeditedSyncState()
         return if (state != null) {
             mapOf(
                 "hasResumableSession" to state.hasProgress,
@@ -2043,6 +2046,7 @@ class SyncManager(
                 "isFullExport" to state.fullExport,
                 "initialExportDone" to initialExportDone,
                 "isSyncing" to processSyncLock.get(),
+                "syncState" to syncState,
                 "createdAt" to dateFormatter.format(java.time.Instant.ofEpochMilli(state.createdAt)),
                 "pausedTypes" to pausedTypes,
                 "resyncingTypes" to resyncingTypes,
@@ -2055,11 +2059,30 @@ class SyncManager(
                 "isFullExport" to false,
                 "initialExportDone" to initialExportDone,
                 "isSyncing" to processSyncLock.get(),
+                "syncState" to syncState,
                 "createdAt" to null,
                 "pausedTypes" to pausedTypes,
                 "resyncingTypes" to resyncingTypes,
             )
         }
+    }
+
+    /**
+     * The one-off sync job (the one that runs the initial export): "scheduled" while WorkManager holds or runs it,
+     * "idle" when it is done or missing, "unknown" when WorkManager doesn't answer in time. The periodic job is
+     * always queued, so it is not counted.
+     */
+    private fun expeditedSyncState(): String = try {
+        runBlocking {
+            withTimeoutOrNull(SyncDefaults.WORK_INFO_TIMEOUT_MS) {
+                WorkManager.getInstance(context)
+                    .getWorkInfosForUniqueWorkFlow(SyncDefaults.WORK_NAME_EXPEDITED)
+                    .first()
+                    .map { it.state }
+            }
+        }?.let { if (isSyncWorkPending(it)) "scheduled" else "idle" } ?: "unknown"
+    } catch (e: Exception) {
+        "unknown"
     }
 
     fun hasResumableSyncSession(): Boolean {

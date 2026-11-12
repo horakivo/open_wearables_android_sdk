@@ -54,7 +54,9 @@ object SyncDefaults {
     const val INCOMPLETE_RUN_RETRY_MS = 2L * 60L * 1000L
     const val WORK_NAME_PERIODIC = "health_sync_periodic"
     const val WORK_NAME_EXPEDITED = "health_sync_expedited"
-    const val SDK_VERSION = "0.17.0"
+    // How long getSyncStatus waits for WorkManager before reporting the job's state as "unknown".
+    const val WORK_INFO_TIMEOUT_MS = 250L
+    const val SDK_VERSION = "0.17.1"
 }
 
 object StorageKeys {
