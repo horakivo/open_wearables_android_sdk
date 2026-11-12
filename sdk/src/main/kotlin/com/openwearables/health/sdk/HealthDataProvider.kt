@@ -41,6 +41,14 @@ interface HealthDataProvider {
     fun getTrackedTypes(): Set<String>
 
     /**
+     * The store record [typeId] reads. Ids with the same key are aliases: the provider tracks
+     * one of them and a single read serves all (Health Connect: `distanceWalkingRunning` and
+     * `distanceCycling` both read `DistanceRecord`). `null` when the provider cannot read it.
+     * Used to match the app's per-type pause / resync ids to tracked types.
+     */
+    fun storageKey(typeId: String): String? = typeId
+
+    /**
      * Show the provider's native permission UI for the given [typeIds].
      * Returns `true` when at least one requested data type was granted.
      * Types the user denied are removed from the tracked set and are not synced.
@@ -95,6 +103,12 @@ interface HealthDataProvider {
      * read complete without one and must not pause the sync.
      */
     fun canTrackChanges(typeId: String): Boolean = supportsChangeTracking()
+
+    /**
+     * Whether the app may read [typeId] now. `false` only when the permission is known to be
+     * missing (revoked after authorization); errors count as readable.
+     */
+    suspend fun hasReadPermission(typeId: String): Boolean = true
 
     /** Mint a change token at "now" so later [readChanges] sees only subsequent writes. */
     suspend fun mintChangeToken(typeId: String): String? = null

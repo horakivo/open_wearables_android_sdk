@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.17.0
+
+* **Per-type pause / resume / resync** (Health Connect): `pauseTypes`, `resumeTypes`, `getPausedTypes` and `suspend resyncTypes` take the app's type ids. A paused type is skipped by every sync, including the initial export and a run already in flight, and keeps its change token. Resume continues from that token, or resyncs when the type has none or was paused for 30+ days. A resync re-reads the type newest-first over `syncDaysBack` while the other types stay incremental; an interrupted resync resumes as a resync of just those types. Alias ids that share a Health Connect record pause that record only when all of them are paused (`requestAuthorization` now stores the ids as requested to tell). `getSyncStatus()` adds `pausedTypes` and `resyncingTypes`. The paused list is per user and cleared by `signOut()` only; `resetAnchors()` drops pending resyncs.
+* **Worker retry after a failed run**: a background run that stops short for a reason other than a rate limit (upload failure, change-token mint failure) re-enqueues itself after `INCOMPLETE_RUN_RETRY_MS` (2 min) instead of immediately.
 
 ## 0.16.0
 

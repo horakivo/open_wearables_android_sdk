@@ -45,15 +45,24 @@ object SyncDefaults {
      * that happened after the previous token and before remint.
      */
     const val CHANGE_CATCHUP_MS = 30L * 24 * 60 * 60 * 1000
+    /**
+     * A type paused at least this long is re-read in full on resume: its change token has
+     * expired, and the 30-day catch-up would miss older edits and every deletion.
+     */
+    const val PAUSE_RESYNC_AFTER_MS = 30L * 24 * 60 * 60 * 1000
+    /** Wait before the worker retries a run that stopped short (not a rate limit). */
+    const val INCOMPLETE_RUN_RETRY_MS = 2L * 60L * 1000L
     const val WORK_NAME_PERIODIC = "health_sync_periodic"
     const val WORK_NAME_EXPEDITED = "health_sync_expedited"
-    const val SDK_VERSION = "0.16.0"
+    const val SDK_VERSION = "0.17.0"
 }
 
 object StorageKeys {
     const val SYNC_PREFS_NAME = "com.openwearables.healthsdk.sync"
     const val KEY_ANCHORS = "anchors"
     const val KEY_CHANGE_TOKENS = "change_tokens"
+    /** Wrapper ids with a requested resync not finished yet. Cleared with the anchors. */
+    const val KEY_RESYNC_TYPES = "resync_types"
     const val SYNC_STATE_DIR = "health_sync_state"
     const val SYNC_STATE_FILE = "state.json"
 }

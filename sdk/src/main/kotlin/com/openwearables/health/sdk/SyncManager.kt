@@ -49,6 +49,12 @@ data class TypeSyncProgress(
     var pendingChangeToken: String? = null
 )
 
+/**
+ * One sync run's resumable progress.
+ *
+ * [fullExport] is the initial export: every type is read newest-first. Otherwise only the
+ * types in [resyncTypes] are (a per-type resync); the rest follow their change tokens.
+ */
 @Serializable
 data class SyncState(
     val userKey: String,
@@ -57,7 +63,8 @@ data class SyncState(
     var typeProgress: MutableMap<String, TypeSyncProgress> = mutableMapOf(),
     var totalSentCount: Int = 0,
     var completedTypes: MutableSet<String> = mutableSetOf(),
-    var currentTypeIndex: Int = 0
+    var currentTypeIndex: Int = 0,
+    var resyncTypes: MutableSet<String> = mutableSetOf(),
 ) {
     val hasProgress: Boolean
         get() = totalSentCount > 0 || completedTypes.isNotEmpty()
@@ -121,6 +128,20 @@ class SyncManager(
         internal val syncEpoch = AtomicInteger(0)
 
         /**
+         * Per [HealthDataProvider.storageKey], bumped when that type is paused or a resync is
+         * requested for it. A run that started earlier drops the type and must not write its
+         * cursor back. Kept apart from [syncEpoch] so the rest of the run keeps its progress.
+         */
+        private val typeEpochs = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+        /**
+         * Guards every read-modify-write of [StorageKeys.KEY_RESYNC_TYPES] together with the
+         * epoch check/bump that decides it: the app thread adds requests while a sync thread
+         * clears finished ones.
+         */
+        private val resyncLock = Any()
+
+        /**
          * Set when a run stops because Health Connect rejected a read.
          * The worker that owns the run consumes this and delays the follow-up.
          */
@@ -142,9 +163,41 @@ class SyncManager(
             .withZone(java.time.ZoneOffset.UTC)
 
     private val isSyncing = AtomicBoolean(false)
+
+    /**
+     * False when the last [syncNow] stopped before every type finished (upload failure,
+     * rate limit, token mint failure). The worker then retries after a delay instead of
+     * re-enqueueing itself immediately.
+     */
+    @Volatile
+    var lastRunCompleted: Boolean = true
+        private set
+
+    /** Test seam: replaces the HTTP upload of one sync batch. */
+    internal var uploadOverride: (suspend (endpoint: String, data: UnifiedHealthData) -> SendResult)? = null
     private var runEpoch = 0
+    private var runTypeEpochs: Map<String, Int> = emptyMap()
 
     private fun writesAllowed(): Boolean = runEpoch == syncEpoch.get()
+
+    private fun epochKey(type: String): String = healthProvider.storageKey(type) ?: type
+
+    private fun snapshotTypeEpochs() {
+        runTypeEpochs = HashMap(typeEpochs)
+    }
+
+    /** False once [type] was paused or rescheduled for resync after this run started. */
+    private fun typeEpochCurrent(type: String): Boolean {
+        val key = epochKey(type)
+        return (typeEpochs[key] ?: 0) == (runTypeEpochs[key] ?: 0)
+    }
+
+    private fun typeWritesAllowed(type: String): Boolean = writesAllowed() && typeEpochCurrent(type)
+
+    /** Makes a running sync drop [typeIds] (wrapper or tracked ids) and keep its hands off their cursors. */
+    fun invalidateTypes(typeIds: Collection<String>) {
+        for (key in typeIds.mapTo(HashSet()) { epochKey(it) }) typeEpochs.merge(key, 1, Int::plus)
+    }
     private val tokenRefreshLock = ReentrantLock()
     private var isRefreshingToken = false
 
@@ -249,7 +302,11 @@ class SyncManager(
         schedulePeriodicSync(replace = true)
     }
 
-    fun scheduleExpeditedSync(initialDelayMs: Long = 0L) {
+    /**
+     * @param keepExisting keep an expedited sync that is already enqueued or running
+     *   instead of replacing (cancelling) it.
+     */
+    fun scheduleExpeditedSync(initialDelayMs: Long = 0L, keepExisting: Boolean = false) {
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
@@ -264,10 +321,12 @@ class SyncManager(
         val expeditedWork = builder.build()
 
         WorkManager.getInstance(context).enqueueUniqueWork(
-            SyncDefaults.WORK_NAME_EXPEDITED, ExistingWorkPolicy.REPLACE, expeditedWork
+            SyncDefaults.WORK_NAME_EXPEDITED,
+            if (keepExisting) ExistingWorkPolicy.KEEP else ExistingWorkPolicy.REPLACE,
+            expeditedWork
         )
         if (initialDelayMs > 0L) {
-            logger("Scheduled sync in ${initialDelayMs / 1000}s (Health Connect rate limit)")
+            logger("Scheduled sync in ${initialDelayMs / 1000}s")
         } else {
             logger("Scheduled expedited sync")
         }
@@ -290,7 +349,11 @@ class SyncManager(
             logger("Sync already in progress")
             return
         }
+        lastRunCompleted = true
         runEpoch = syncEpoch.get()
+        // Before the paused list is read: a pause landing in between then drops the type
+        // from this run instead of letting it sync to the end.
+        snapshotTypeEpochs()
         isSyncing.set(true)
         quotaBackoffPending.set(false)
 
@@ -308,34 +371,70 @@ class SyncManager(
             }
             val endpoint = SyncEndpoints.sync(endpoints, userId)
 
-            val trackedTypes = healthProvider.getTrackedTypes().toList()
-            if (trackedTypes.isEmpty()) {
+            val allTrackedTypes = healthProvider.getTrackedTypes().toList()
+            if (allTrackedTypes.isEmpty()) {
                 logger("No tracked types configured")
+                return
+            }
+            val pausedTypes = pausedTrackedTypes(allTrackedTypes)
+            val trackedTypes = allTrackedTypes.filter { it !in pausedTypes }
+            if (pausedTypes.isNotEmpty()) {
+                logger("Sync: skipping paused type(s): ${pausedTypes.joinToString()}")
+            }
+            if (trackedTypes.isEmpty()) {
+                // Nothing to read. An unfinished initial export counts as done without the
+                // paused types (they resync on resume); otherwise the worker would keep
+                // re-enqueueing itself for an export that can never progress.
+                logger("Sync: every tracked type is paused")
+                stateMutex.withLock {
+                    if (!hasCompletedInitialSync()) markFullExportDone()
+                    clearSyncSessionInternal()
+                }
                 return
             }
 
             val existingState = stateMutex.withLock { loadSyncStateFromDisk() }
             val isResuming = existingState != null && existingState.hasProgress
+            var pendingResync = pendingResyncTrackedTypes(trackedTypes)
+            // A resync of a type whose read permission was revoked can never finish (no
+            // token, no data); drop it instead of retrying it forever.
+            val unreadable = pendingResync.filter { !healthProvider.hasReadPermission(it) }
+            if (unreadable.isNotEmpty()) {
+                logger("Sync: dropping resync of ${unreadable.joinToString()} (read permission not granted)")
+                unreadable.forEach { completePendingResync(it, "resync dropped") }
+                pendingResync = pendingResync - unreadable.toSet()
+            }
 
             val floor = syncStartTimestamp()
             val floorLabel = if (floor != null) "since ${java.time.Instant.ofEpochMilli(floor)}" else "full history"
 
             val effectiveFullExport: Boolean
+            val fullExportTypes: Set<String>
             if (isResuming) {
                 effectiveFullExport = existingState!!.fullExport
                 logger("Sync: resuming (${existingState.totalSentCount} sent, ${existingState.completedTypes.size}/${trackedTypes.size} types done, $floorLabel)")
-                stateMutex.withLock { inMemoryState = existingState }
+                fullExportTypes = stateMutex.withLock {
+                    inMemoryState = existingState
+                    startPendingResyncs(existingState, pendingResync)
+                    PerTypeSync.fullExportScope(existingState, trackedTypes)
+                }
             } else {
                 effectiveFullExport = fullExport || !hasCompletedInitialSync()
                 val mode = if (effectiveFullExport) "full export" else "incremental"
                 logger("Sync: starting ($mode, ${trackedTypes.size} types, ${healthProvider.providerName}, $floorLabel)")
-                stateMutex.withLock {
-                    inMemoryState = SyncState(
+                fullExportTypes = stateMutex.withLock {
+                    val state = SyncState(
                         userKey = userKey(), fullExport = effectiveFullExport,
                         createdAt = System.currentTimeMillis()
                     )
+                    inMemoryState = state
+                    startPendingResyncs(state, pendingResync)
                     persistStateToDisk()
+                    PerTypeSync.fullExportScope(state, trackedTypes)
                 }
+            }
+            if (!effectiveFullExport && fullExportTypes.isNotEmpty()) {
+                logger("Sync: resyncing ${fullExportTypes.joinToString()} (full history of these types)")
             }
 
             val syncStartTime = System.currentTimeMillis()
@@ -367,7 +466,7 @@ class SyncManager(
             }
 
             var roundRobin = processTypesRoundRobin(
-                trackedTypes, effectiveFullExport, endpoint, background,
+                trackedTypes, fullExportTypes, endpoint, background,
             )
 
             // Server-side data reset detected mid-run: cursors are already cleared
@@ -375,18 +474,34 @@ class SyncManager(
             // full export. A second reset within the same call is left for the next
             // scheduled sync rather than looping here.
             if (roundRobin.generationReset) {
-                logger("Sync: restarting as full export (server data reset)")
                 // resetAnchors bumped the epoch; this restart is a new run, not a stale one.
                 runEpoch = syncEpoch.get()
-                stateMutex.withLock {
-                    inMemoryState = SyncState(
-                        userKey = userKey(), fullExport = true,
-                        createdAt = System.currentTimeMillis()
-                    )
-                    persistStateToDisk()
+                snapshotTypeEpochs()
+                // Re-read the paused list (after the snapshot): a type paused during the run
+                // must not be re-exported. The app's "delete and pause" pauses first, and the
+                // server delete is what bumps the generation.
+                val restartAll = healthProvider.getTrackedTypes().toList()
+                val restartPaused = pausedTrackedTypes(restartAll)
+                val restartTypes = restartAll.filter { it !in restartPaused }
+                if (restartTypes.isEmpty()) {
+                    logger("Sync: server data reset; every tracked type is paused, nothing to re-export")
+                    stateMutex.withLock {
+                        markFullExportDone()
+                        clearSyncSessionInternal()
+                    }
+                    roundRobin = RoundRobinResult(true, 0, emptyList())
+                } else {
+                    logger("Sync: restarting as full export (server data reset)")
+                    stateMutex.withLock {
+                        inMemoryState = SyncState(
+                            userKey = userKey(), fullExport = true,
+                            createdAt = System.currentTimeMillis()
+                        )
+                        persistStateToDisk()
+                    }
+                    fullSyncStartTime = System.currentTimeMillis()
+                    roundRobin = processTypesRoundRobin(restartTypes, restartTypes.toSet(), endpoint, background)
                 }
-                fullSyncStartTime = System.currentTimeMillis()
-                roundRobin = processTypesRoundRobin(trackedTypes, true, endpoint, background)
             }
             roundRobin
             }
@@ -400,6 +515,7 @@ class SyncManager(
                 }
             }
 
+            lastRunCompleted = result.completed
             fullSyncStartTime = null
             currentLogsEndpoint = null
         } finally {
@@ -450,12 +566,17 @@ class SyncManager(
         else -> 1.0
     }
 
+    /**
+     * @param fullExportTypes types read newest-first over their whole history: every type
+     *   in the initial export, only the resyncing ones otherwise. The rest read incrementally.
+     */
     private suspend fun processTypesRoundRobin(
         types: List<String>,
-        fullExport: Boolean,
+        fullExportTypes: Set<String>,
         endpoint: String,
         background: Boolean,
     ): RoundRobinResult {
+        fun isFullExport(type: String) = type in fullExportTypes
         val olderThanCursors = mutableMapOf<String, Long?>()
         val anchorCursors = mutableMapOf<String, Long?>()
         val changeTokens = mutableMapOf<String, String?>()
@@ -475,13 +596,14 @@ class SyncManager(
             }
         }
 
-        if (fullExport && healthProvider.supportsChangeTracking()) {
+        if (fullExportTypes.isNotEmpty() && healthProvider.supportsChangeTracking()) {
             // Capture each type's change token BEFORE its first export page, so the first
             // incremental sync replays everything written or deleted while the (possibly
             // multi-hour) export ran. A token minted at type completion would skip those.
             // A failed capture is retried by Phase 4 when the type completes.
             var captured = false
             for (type in types) {
+                if (!isFullExport(type)) continue
                 if (completedTypes.contains(type) || changeTokens[type] != null) continue
                 if (!healthProvider.canTrackChanges(type)) continue
                 val token = healthProvider.mintChangeToken(type) ?: continue
@@ -496,12 +618,14 @@ class SyncManager(
             if (captured) stateMutex.withLock { persistStateToDisk() }
         }
 
-        if (!fullExport) {
+        if (types.any { !isFullExport(it) }) {
             val anchors = loadAnchors()
             val storedTokens = loadChangeTokens()
             val floor = syncStartTimestamp()
             for (type in types) {
-                if (completedTypes.contains(type)) continue
+                // A resyncing type must not pick up its old token: completing the resync
+                // would store it instead of the one minted before the re-read.
+                if (isFullExport(type) || completedTypes.contains(type)) continue
                 if (!changeTokens.containsKey(type)) {
                     storedTokens[type]?.let { changeTokens[type] = it }
                 }
@@ -539,9 +663,36 @@ class SyncManager(
         suspend fun timedFetch(fetchTypes: List<String>, limits: Map<String, Int>): RoundFetch {
             val started = System.nanoTime()
             val results = fetchTypesForRound(
-                fetchTypes, fullExport, olderThanCursors, anchorCursors, changeTokens, limits,
+                fetchTypes, fullExportTypes, olderThanCursors, anchorCursors, changeTokens, limits,
             )
             return RoundFetch(results, (System.nanoTime() - started) / 1_000_000)
+        }
+
+        // Types still part of this run. A type paused, or rescheduled for resync, while the
+        // run is in flight leaves it: its cursors are dropped (its stored token stays as it
+        // was) and anything already read for it is not committed.
+        val activeTypes = types.toMutableList()
+        suspend fun dropInvalidatedTypes() {
+            val stale = activeTypes.filter { !typeEpochCurrent(it) }
+            if (stale.isEmpty()) return
+            activeTypes.removeAll(stale)
+            for (type in stale) {
+                completedTypes.remove(type)
+                olderThanCursors.remove(type)
+                anchorCursors.remove(type)
+                changeTokens.remove(type)
+            }
+            logger("Sync: dropping ${stale.joinToString()} from this run (paused or resync requested)")
+            stateMutex.withLock {
+                inMemoryState?.let { state ->
+                    for (type in stale) {
+                        state.typeProgress.remove(type)
+                        state.completedTypes.remove(type)
+                        state.resyncTypes.remove(type)
+                    }
+                }
+                persistStateToDisk()
+            }
         }
 
         var loggedSmallPages: Boolean? = null
@@ -550,7 +701,8 @@ class SyncManager(
         // cancels it; cursors are persisted only after a 2xx.
         var prefetched: Deferred<RoundFetch>? = null
         while (true) {
-            val incompleteTypes = types.filter { !completedTypes.contains(it) }
+            dropInvalidatedTypes()
+            val incompleteTypes = activeTypes.filter { !completedTypes.contains(it) }
             if (incompleteTypes.isEmpty()) break
 
             // The worker always asks for a background run. While the app is open,
@@ -570,7 +722,8 @@ class SyncManager(
             // Health Connect reads are cross-process; do not wait on them one by one.
             val round = prefetched?.await() ?: timedFetch(incompleteTypes, pageLimits(incompleteTypes, smallPages))
             prefetched = null
-            val roundResults = round.results
+            // A prefetched page may include a type dropped since it was requested.
+            val roundResults = round.results.filter { it.type in activeTypes && typeEpochCurrent(it.type) }
 
             // Learn the real expansion from a FULL page: a provider writes a series
             // consistently, so the next page can jump straight to the right size. The tail
@@ -588,7 +741,7 @@ class SyncManager(
                 if (result.isDone) {
                     completedTypes.add(result.type)
                 } else {
-                    if (fullExport) olderThanCursors[result.type] = result.nextCursor
+                    if (isFullExport(result.type)) olderThanCursors[result.type] = result.nextCursor
                     else {
                         result.nextCursor?.let { anchorCursors[result.type] = it }
                         result.nextChangeToken?.let { changeTokens[result.type] = it }
@@ -600,7 +753,7 @@ class SyncManager(
 
             // Read the following page during the upload. Cursors above are already
             // the next page; they are written to disk only after a 2xx.
-            val stillIncomplete = types.filter { !completedTypes.contains(it) }
+            val stillIncomplete = activeTypes.filter { !completedTypes.contains(it) }
             if (!hitQuota && stillIncomplete.isNotEmpty()) {
                 val nextLimits = pageLimits(stillIncomplete, smallPages)
                 prefetched = async { timedFetch(stillIncomplete, nextLimits) }
@@ -667,20 +820,21 @@ class SyncManager(
             // Phase 4 mints a token. A failed mint leaves the type incomplete
             // so the next incremental run cannot start from nil and re-crawl history.
             val newlyCompletedTypes = mutableListOf<Pair<String, Int>>()
-            val deferCompleteForToken = fullExport && healthProvider.supportsChangeTracking()
+            fun deferCompleteForToken(type: String) = isFullExport(type) && healthProvider.supportsChangeTracking()
             val persistStart = System.nanoTime()
             stateMutex.withLock {
                 for (result in roundResults) {
-                    val persistComplete = result.isDone && !deferCompleteForToken
+                    if (!typeEpochCurrent(result.type)) continue
+                    val persistComplete = result.isDone && !deferCompleteForToken(result.type)
                     updateInMemoryProgress(
                         result.type, result.count, isComplete = persistComplete,
                         anchorTimestamp = result.anchorTimestamp,
                         changeToken = result.nextChangeToken,
                     )
-                    if (fullExport && !result.isDone && !result.quotaExceeded) {
+                    if (isFullExport(result.type) && !result.isDone && !result.quotaExceeded) {
                         inMemoryState?.typeProgress?.get(result.type)?.pendingOlderThan = result.nextCursor
                     }
-                    if (!fullExport && !result.isDone) {
+                    if (!isFullExport(result.type) && !result.isDone) {
                         result.nextChangeToken?.let {
                             inMemoryState?.typeProgress?.get(result.type)?.pendingChangeToken = it
                         }
@@ -715,61 +869,78 @@ class SyncManager(
 
             // Phase 4: mint HC change tokens after a successful upload.
             // A failed mint pauses the sync instead of pretending the type is done.
-            if (deferCompleteForToken) {
-                val doneThisRound = roundResults.filter { it.isDone }
-                for (done in doneThisRound) {
-                    if (!healthProvider.canTrackChanges(done.type)) {
-                        logger("  ${done.type}: no change stream, marking complete")
-                        stateMutex.withLock {
-                            updateInMemoryProgress(
-                                done.type, sentInChunk = 0, isComplete = true,
-                                anchorTimestamp = null, changeToken = null,
-                            )
-                            persistStateToDisk()
-                            newlyCompletedTypes.add(
-                                done.type to (inMemoryState?.typeProgress?.get(done.type)?.sentCount ?: 0)
-                            )
-                        }
-                        continue
-                    }
-                    val minted = changeTokens[done.type] ?: healthProvider.mintChangeToken(done.type)
-                    if (minted == null) {
-                        prefetched?.cancel()
-                        prefetched = null
-                        logger("  ${done.type}: change token mint failed — leaving type incomplete, pausing sync")
-                        completedTypes.remove(done.type)
-                        stateMutex.withLock {
-                            inMemoryState?.completedTypes?.remove(done.type)
-                            inMemoryState?.typeProgress?.get(done.type)?.isComplete = false
-                            persistStateToDisk()
-                        }
-                        val (totalSent, typeResults) = stateMutex.withLock {
-                            val state = inMemoryState
-                            val sent = state?.totalSentCount ?: 0
-                            val results = types.map { type ->
-                                TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
-                            }
-                            Pair(sent, results)
-                        }
-                        return@syncRound RoundRobinResult(false, totalSent, typeResults)
-                    }
-                    logger("  ${done.type}: captured change token after full export")
+            val doneThisRound = roundResults.filter { it.isDone && deferCompleteForToken(it.type) }
+            for (done in doneThisRound) {
+                if (!typeEpochCurrent(done.type)) continue
+                if (!healthProvider.canTrackChanges(done.type)) {
+                    logger("  ${done.type}: no change stream, marking complete")
                     stateMutex.withLock {
                         updateInMemoryProgress(
                             done.type, sentInChunk = 0, isComplete = true,
-                            anchorTimestamp = null, changeToken = minted,
+                            anchorTimestamp = null, changeToken = null,
+                        )
+                        persistStateToDisk()
+                        newlyCompletedTypes.add(
+                            done.type to (inMemoryState?.typeProgress?.get(done.type)?.sentCount ?: 0)
+                        )
+                    }
+                    continue
+                }
+                val minted = changeTokens[done.type] ?: healthProvider.mintChangeToken(done.type)
+                val perTypeResync = stateMutex.withLock {
+                    inMemoryState?.let { !it.fullExport && done.type in it.resyncTypes } == true
+                }
+                if (minted == null && perTypeResync && !quotaBackoffPending.get()) {
+                    // Not a rate limit: most likely the read permission was revoked. Retrying
+                    // cannot succeed, and leaving the resync open would re-run it forever
+                    // while every other type waits. The stored token (if any) stays.
+                    logger("  ${done.type}: change token mint failed — finishing resync without a new token")
+                    stateMutex.withLock {
+                        updateInMemoryProgress(
+                            done.type, sentInChunk = 0, isComplete = true,
+                            anchorTimestamp = null, changeToken = null,
                         )
                         persistStateToDisk()
                         newlyCompletedTypes.add(done.type to (inMemoryState?.typeProgress?.get(done.type)?.sentCount ?: 0))
                     }
+                    continue
+                }
+                if (minted == null) {
+                    prefetched?.cancel()
+                    prefetched = null
+                    logger("  ${done.type}: change token mint failed — leaving type incomplete, pausing sync")
+                    completedTypes.remove(done.type)
+                    stateMutex.withLock {
+                        inMemoryState?.completedTypes?.remove(done.type)
+                        inMemoryState?.typeProgress?.get(done.type)?.isComplete = false
+                        persistStateToDisk()
+                    }
+                    val (totalSent, typeResults) = stateMutex.withLock {
+                        val state = inMemoryState
+                        val sent = state?.totalSentCount ?: 0
+                        val results = types.map { type ->
+                            TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
+                        }
+                        Pair(sent, results)
+                    }
+                    return@syncRound RoundRobinResult(false, totalSent, typeResults)
+                }
+                logger("  ${done.type}: captured change token after full export")
+                stateMutex.withLock {
+                    updateInMemoryProgress(
+                        done.type, sentInChunk = 0, isComplete = true,
+                        anchorTimestamp = null, changeToken = minted,
+                    )
+                    persistStateToDisk()
+                    newlyCompletedTypes.add(done.type to (inMemoryState?.typeProgress?.get(done.type)?.sentCount ?: 0))
                 }
             }
 
             val startTime = fullSyncStartTime
             val logEndpoint = currentLogsEndpoint
-            if (fullExport && startTime != null && logEndpoint != null && newlyCompletedTypes.isNotEmpty()) {
+            if (startTime != null && logEndpoint != null && newlyCompletedTypes.isNotEmpty()) {
                 for ((type, count) in newlyCompletedTypes) {
-                    if (count > 0) {
+                    if (count > 0 && isFullExport(type)) {
                         val durationMs = (System.currentTimeMillis() - startTime).toInt()
                         logger("Sending sync end log: ${payloadTypeName(type)} ($count records, ${durationMs}ms)")
                         launch {
@@ -790,7 +961,10 @@ class SyncManager(
             val results = types.map { type ->
                 TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
             }
-            if (state?.fullExport == true) markFullExportDone()
+            if (state?.fullExport == true) {
+                markFullExportDone()
+                resyncTypesExportMissed()
+            }
             if (state != null) {
                 logger("Sync: complete ($sent items, ${state.completedTypes.size} types)")
                 if (state.fullExport && sent == 0) {
@@ -815,13 +989,13 @@ class SyncManager(
 
     private suspend fun fetchTypesForRound(
         types: List<String>,
-        fullExport: Boolean,
+        fullExportTypes: Set<String>,
         olderThanCursors: Map<String, Long?>,
         anchorCursors: Map<String, Long?>,
         changeTokens: Map<String, String?>,
         limits: Map<String, Int>,
     ): List<FetchResult> {
-        suspend fun fetch(type: String): FetchResult = if (fullExport) {
+        suspend fun fetch(type: String): FetchResult = if (type in fullExportTypes) {
             fetchOneChunkNewestFirst(type, olderThanCursors[type], limits.getValue(type))
         } else {
             fetchOneChunkIncremental(type, anchorCursors[type], changeTokens[type], limits.getValue(type))
@@ -1022,6 +1196,7 @@ class SyncManager(
         changeToken: String? = null,
     ) {
         val state = inMemoryState ?: return
+        if (!typeEpochCurrent(typeIdentifier)) return
         val progress = state.typeProgress.getOrPut(typeIdentifier) { TypeSyncProgress(typeIdentifier) }
         progress.sentCount += sentInChunk
         progress.isComplete = isComplete
@@ -1032,6 +1207,10 @@ class SyncManager(
             state.completedTypes.add(typeIdentifier)
             progress.pendingAnchorTimestamp?.let { saveAnchor(typeIdentifier, it) }
             progress.pendingChangeToken?.let { saveChangeToken(typeIdentifier, it) }
+            // A full read of the type (initial export or resync) satisfies a pending resync.
+            if (state.fullExport || typeIdentifier in state.resyncTypes) {
+                completePendingResync(typeIdentifier)
+            }
         }
     }
 
@@ -1116,6 +1295,7 @@ class SyncManager(
     }
 
     private suspend fun sendHealthData(endpoint: String, data: UnifiedHealthData): SendResult {
+        uploadOverride?.let { return it(endpoint, data) }
         val bytes = withContext(dispatchers.io) {
             val raw = encodeHealthPayload(data)
             val gzipped = gzip(raw)
@@ -1243,7 +1423,7 @@ class SyncManager(
 
     // MARK: - Send with Auth Retry
 
-    private data class SendResult(
+    internal data class SendResult(
         val success: Boolean,
         val statusCode: Int?,
         val payloadSizeKb: Int,
@@ -1567,7 +1747,7 @@ class SyncManager(
     }
 
     private fun saveAnchor(type: String, timestamp: Long) {
-        if (!writesAllowed()) return
+        if (!typeWritesAllowed(type)) return
         val current = loadAnchors().toMutableMap()
         current[type] = timestamp
         syncPrefs.edit().putString(
@@ -1584,7 +1764,7 @@ class SyncManager(
     }
 
     private fun saveChangeToken(type: String, token: String) {
-        if (!writesAllowed()) return
+        if (!typeWritesAllowed(type)) return
         if (token.startsWith(CATCHUP_TOKEN_PREFIX)) return
         val current = loadChangeTokens().toMutableMap()
         current[type] = token
@@ -1595,17 +1775,170 @@ class SyncManager(
         runBlocking {
             stateMutex.withLock {
                 syncEpoch.incrementAndGet()
-                syncPrefs.edit()
-                    .remove(StorageKeys.KEY_ANCHORS)
-                    .remove(StorageKeys.KEY_CHANGE_TOKENS)
-                    .remove(syncGenerationKey())
-                    .putBoolean(fullDoneKey(), false)
-                    .commit()
+                synchronized(resyncLock) {
+                    syncPrefs.edit()
+                        .remove(StorageKeys.KEY_ANCHORS)
+                        .remove(StorageKeys.KEY_CHANGE_TOKENS)
+                        // The full export that follows re-reads every type; pending resyncs are moot.
+                        .remove(StorageKeys.KEY_RESYNC_TYPES)
+                        .remove(syncGenerationKey())
+                        .putBoolean(fullDoneKey(), false)
+                        .commit()
+                }
                 clearSyncSessionInternal()
             }
         }
         logger("Anchors reset - will perform full sync on next sync")
     }
+
+    // MARK: - Per-type pause / resync
+
+    // Paused and pending-resync ids are the app's wrapper ids; the sync loop works on tracked
+    // ids (one per alias group). See [PerTypeSync] for the folding rule.
+
+    /** Tracked ids: the provider's, or the stored list when it has not been set yet (worker). */
+    private fun knownTrackedTypes(): Collection<String> =
+        healthProvider.getTrackedTypes().ifEmpty { secureStorage.getTrackedTypes().toSet() }
+
+    private fun pausedTrackedTypes(tracked: Collection<String>): Set<String> =
+        PerTypeSync.pausedTrackedTypes(
+            tracked, secureStorage.getRequestedTypes(), secureStorage.getPausedTypes().keys,
+            healthProvider::storageKey,
+        )
+
+    private fun loadPendingResyncs(): List<String> =
+        PerTypeSync.decodeIds(syncPrefs.getString(StorageKeys.KEY_RESYNC_TYPES, null))
+
+    private fun savePendingResyncs(ids: Collection<String>) {
+        syncPrefs.edit().putString(StorageKeys.KEY_RESYNC_TYPES, PerTypeSync.encodeIds(ids.distinct())).commit()
+    }
+
+    /** Tracked ids, among [activeTypes], with a pending resync. */
+    private fun pendingResyncTrackedTypes(activeTypes: Collection<String>): Set<String> =
+        PerTypeSync.trackedFor(loadPendingResyncs(), activeTypes, healthProvider::storageKey)
+
+    /** Pending resync wrapper ids that fold into a tracked, unpaused type. */
+    private fun actionablePendingResyncs(): List<String> {
+        val pending = loadPendingResyncs()
+        if (pending.isEmpty()) return emptyList()
+        return PerTypeSync.actionableResyncs(
+            pending, knownTrackedTypes(), secureStorage.getRequestedTypes(),
+            secureStorage.getPausedTypes().keys, healthProvider::storageKey,
+        )
+    }
+
+    private fun startPendingResyncs(state: SyncState, pending: Set<String>) {
+        if (pending.isEmpty()) return
+        val started = PerTypeSync.applyPendingResyncs(state, pending)
+        if (started.isNotEmpty()) {
+            logger("Sync: starting resync of ${started.joinToString()}")
+            persistStateToDisk()
+        }
+    }
+
+    /** Clears the pending resync ids that fold into [trackedId] once it was read in full. */
+    private fun completePendingResync(trackedId: String, outcome: String = "resync complete") {
+        synchronized(resyncLock) {
+            // Checked under the lock: a request made after this run read the type bumped the
+            // epoch first, so it is kept.
+            if (!typeWritesAllowed(trackedId)) return
+            val pending = loadPendingResyncs()
+            if (pending.isEmpty()) return
+            val key = epochKey(trackedId)
+            val remaining = pending.filter { it != trackedId && healthProvider.storageKey(it) != key }
+            if (remaining.size != pending.size) {
+                savePendingResyncs(remaining)
+                logger("  $trackedId: $outcome")
+            }
+        }
+    }
+
+    /**
+     * Records a resync for [typeIds] (wrapper ids, already filtered by the caller) and makes
+     * a running sync drop them, so it cannot store their old cursors afterwards.
+     */
+    fun scheduleResync(typeIds: Collection<String>) {
+        if (typeIds.isEmpty()) return
+        synchronized(resyncLock) {
+            // Epoch first: a run finishing the same type then cannot clear this request.
+            invalidateTypes(typeIds)
+            savePendingResyncs(loadPendingResyncs() + typeIds)
+        }
+    }
+
+    /**
+     * Of [typeIds] (wrapper ids, not paused), those a resync can apply to: they fold into a
+     * tracked type, and — while the initial export is unfinished — that export has already
+     * completed the type (the export reads the others anyway).
+     */
+    suspend fun resyncCandidates(typeIds: Collection<String>): List<String> {
+        val tracked = knownTrackedTypes()
+        val mapped = typeIds.filter {
+            PerTypeSync.trackedFor(listOf(it), tracked, healthProvider::storageKey).isNotEmpty()
+        }
+        if (hasCompletedInitialSync()) return mapped
+        val exported = stateMutex.withLock { (inMemoryState ?: loadSyncStateFromDisk())?.completedTypes?.toSet() }
+            ?: return emptyList()
+        return mapped.filter {
+            PerTypeSync.trackedFor(listOf(it), exported, healthProvider::storageKey).isNotEmpty()
+        }
+    }
+
+    /**
+     * Wrapper ids among [resumed] whose sync must restart from scratch: their alias group was
+     * fully paused, and the type either has no cursor or was paused for 30+ days.
+     * [pausedAt] is the paused list before the resume. Empty before the initial export
+     * finished: that export reads every unpaused type in full anyway.
+     */
+    fun resyncNeededOnResume(resumed: Collection<String>, pausedAt: Map<String, Long>): List<String> {
+        if (!hasCompletedInitialSync()) return emptyList()
+        val tracked = knownTrackedTypes()
+        val requested = secureStorage.getRequestedTypes()
+        val key = healthProvider::storageKey
+        val before = PerTypeSync.pausedTrackedTypes(tracked, requested, pausedAt.keys, key)
+        val after = PerTypeSync.pausedTrackedTypes(tracked, requested, pausedAt.keys - resumed.toSet(), key)
+        val tokens = loadChangeTokens()
+        val anchors = loadAnchors()
+        val now = System.currentTimeMillis()
+        val needed = (before - after).filter { type ->
+            val hasCursor = if (healthProvider.canTrackChanges(type)) tokens[type] != null else anchors[type] != null
+            PerTypeSync.needsResyncOnResume(PerTypeSync.pausedSince(type, requested, pausedAt, key), now, hasCursor)
+        }
+        return resumed.filter { PerTypeSync.trackedFor(listOf(it), needed, key).isNotEmpty() }
+    }
+
+    /**
+     * Invalidates the tracked types that pausing [typeIds] stopped, so a running sync drops
+     * them. Not the ids alone: pausing one alias of a record another alias still needs must
+     * leave that record in the run.
+     */
+    fun onTypesPaused(typeIds: Collection<String>) {
+        val tracked = knownTrackedTypes()
+        val stopped = pausedTrackedTypes(tracked).filter {
+            PerTypeSync.trackedFor(typeIds, listOf(it), healthProvider::storageKey).isNotEmpty()
+        }
+        invalidateTypes(stopped)
+    }
+
+    /**
+     * After the initial export: schedules a resync for every unpaused type it left without a
+     * change token (paused or dropped mid-export, resumed before the export ended).
+     */
+    private fun resyncTypesExportMissed() {
+        if (!writesAllowed() || !healthProvider.supportsChangeTracking()) return
+        val tracked = knownTrackedTypes()
+        val paused = pausedTrackedTypes(tracked)
+        val missed = PerTypeSync.typesMissingToken(
+            tracked.filter { it !in paused }, loadChangeTokens(), healthProvider::canTrackChanges,
+        )
+        if (missed.isEmpty()) return
+        logger("Sync: ${missed.joinToString()} missed the initial export, scheduling resync")
+        scheduleResync(missed)
+    }
+
+    /** Unfinished work the worker / foreground hook should run: an export, a resumable run or a resync. */
+    fun hasUnfinishedWork(): Boolean =
+        hasResumableSyncSession() || !hasCompletedInitialSync() || actionablePendingResyncs().isNotEmpty()
 
     // MARK: - Sync Generation
 
@@ -1700,6 +2033,8 @@ class SyncManager(
         // Whether the initial full export (whole history) has ever completed for
         // this user. While false, apps can show a "keep the app open" hint.
         val initialExportDone = hasCompletedInitialSync()
+        val pausedTypes = secureStorage.getPausedTypes().keys.toList()
+        val resyncingTypes = actionablePendingResyncs()
         return if (state != null) {
             mapOf(
                 "hasResumableSession" to state.hasProgress,
@@ -1708,7 +2043,9 @@ class SyncManager(
                 "isFullExport" to state.fullExport,
                 "initialExportDone" to initialExportDone,
                 "isSyncing" to processSyncLock.get(),
-                "createdAt" to dateFormatter.format(java.time.Instant.ofEpochMilli(state.createdAt))
+                "createdAt" to dateFormatter.format(java.time.Instant.ofEpochMilli(state.createdAt)),
+                "pausedTypes" to pausedTypes,
+                "resyncingTypes" to resyncingTypes,
             )
         } else {
             mapOf(
@@ -1718,7 +2055,9 @@ class SyncManager(
                 "isFullExport" to false,
                 "initialExportDone" to initialExportDone,
                 "isSyncing" to processSyncLock.get(),
-                "createdAt" to null
+                "createdAt" to null,
+                "pausedTypes" to pausedTypes,
+                "resyncingTypes" to resyncingTypes,
             )
         }
     }

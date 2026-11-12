@@ -33,6 +33,8 @@ class SecureStorage(private val context: Context) {
         private const val KEY_ENDPOINT_DISCONNECT = "endpointDisconnect"
         private const val KEY_SYNC_ACTIVE = "syncActive"
         private const val KEY_TRACKED_TYPES = "trackedTypes"
+        private const val KEY_REQUESTED_TYPES = "requestedTypes"
+        private const val KEY_PAUSED_TYPES_PREFIX = "pausedTypes."
         private const val KEY_HEALTH_PROVIDER = "healthProvider"
         private const val KEY_APP_INSTALLED = "appInstalled"
         private const val KEY_SYNC_DAYS_BACK = "syncDaysBack"
@@ -226,6 +228,31 @@ class SecureStorage(private val context: Context) {
             emptyList()
         }
     }
+
+    // MARK: - Requested Types (as the app sent them, before alias folding)
+
+    fun saveRequestedTypes(types: List<String>) {
+        configPrefs.edit().putString(KEY_REQUESTED_TYPES, PerTypeSync.encodeIds(types)).apply()
+    }
+
+    /** Ids the app last passed to `requestAuthorization`; empty when never stored. */
+    fun getRequestedTypes(): List<String> =
+        PerTypeSync.decodeIds(configPrefs.getString(KEY_REQUESTED_TYPES, null))
+
+    // MARK: - Paused Types (per user; wiped with the rest of the config on sign-out)
+
+    private fun pausedTypesKey(): String {
+        val userId = try { getUserId() } catch (_: Exception) { null }
+        return KEY_PAUSED_TYPES_PREFIX + if (userId.isNullOrEmpty()) "user.none" else "user.$userId"
+    }
+
+    fun savePausedTypes(pausedAt: Map<String, Long>) {
+        configPrefs.edit().putString(pausedTypesKey(), PerTypeSync.encodePaused(pausedAt)).commit()
+    }
+
+    /** Paused wrapper ids, in pause order, with the epoch ms each was paused at. */
+    fun getPausedTypes(): LinkedHashMap<String, Long> =
+        PerTypeSync.decodePaused(configPrefs.getString(pausedTypesKey(), null))
 
     // MARK: - Sync Days Back
 

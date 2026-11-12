@@ -177,6 +177,20 @@ class HealthConnectManager(
 
     override fun getTrackedTypes(): Set<String> = trackedTypeIds
 
+    override fun storageKey(typeId: String): String? = mapToRecordClass(typeId)?.qualifiedName
+
+    override suspend fun hasReadPermission(typeId: String): Boolean = withContext(dispatchers.io) {
+        val recordClass = mapToRecordClass(typeId) ?: return@withContext false
+        if (client == null) withContext(dispatchers.main) { connect() }
+        val hcClient = client ?: return@withContext true
+        try {
+            HealthPermission.getReadPermission(recordClass) in hcClient.permissionController.getGrantedPermissions()
+        } catch (e: Exception) {
+            logger("  $typeId: permission check failed: ${e.javaClass.simpleName}: ${e.message}")
+            true
+        }
+    }
+
     override fun isAvailable(): Boolean {
         return try {
             HealthConnectClient.getSdkStatus(context) == HealthConnectClient.SDK_AVAILABLE

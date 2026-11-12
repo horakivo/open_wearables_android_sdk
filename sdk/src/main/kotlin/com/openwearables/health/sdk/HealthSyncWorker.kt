@@ -48,7 +48,8 @@ class HealthSyncWorker(
             { android.util.Log.d("HealthSyncWorker", it) }
         )
 
-        val exportUnfinished = syncManager.hasResumableSyncSession() || !syncManager.hasCompletedInitialExport()
+        // Resolved from stored tracked types: the provider's are set further down.
+        val exportUnfinished = syncManager.hasUnfinishedWork()
         if (SyncManager.processSyncLock.get() && !exportUnfinished) {
             android.util.Log.d("HealthSyncWorker", "Skipping — another sync is already running")
             return Result.success()
@@ -90,8 +91,11 @@ class HealthSyncWorker(
             val hitQuota = SyncManager.quotaBackoffPending.getAndSet(false)
             if (hitQuota) {
                 syncManager.scheduleExpeditedSync(initialDelayMs = SyncDefaults.QUOTA_BACKOFF_MS)
-            } else if (syncManager.hasResumableSyncSession() || !syncManager.hasCompletedInitialExport()) {
-                syncManager.scheduleExpeditedSync()
+            } else if (syncManager.hasUnfinishedWork()) {
+                // A run that stopped short (upload failed, token mint failed) would fail the
+                // same way right away; retry after a pause instead of in a tight loop.
+                if (syncManager.lastRunCompleted) syncManager.scheduleExpeditedSync()
+                else syncManager.scheduleExpeditedSync(initialDelayMs = SyncDefaults.INCOMPLETE_RUN_RETRY_MS)
             }
 
             Result.success()
