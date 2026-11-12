@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.17.1
+
+* **`getSyncStatus().syncState`**: `"running"` while a sync runs, `"scheduled"` while WorkManager holds the one-off sync job (the one that runs the initial export, including a delayed retry), `"idle"` when it is done or missing, and `"unknown"` when WorkManager doesn't answer within `WORK_INFO_TIMEOUT_MS` (250 ms). The periodic job isn't counted. `isSyncing` is unchanged. The iOS SDK reports the same field (`"running"` or `"idle"`).
+
 ## 0.17.0
 
 * **Per-type pause / resume / resync** (Health Connect): `pauseTypes`, `resumeTypes`, `getPausedTypes` and `suspend resyncTypes` take the app's type ids. A paused type is skipped by every sync, including the initial export and a run already in flight, and keeps its change token. Resume continues from that token, or resyncs when the type has none or was paused for 30+ days. A resync re-reads the type newest-first over `syncDaysBack` while the other types stay incremental; an interrupted resync resumes as a resync of just those types. Alias ids that share a Health Connect record pause that record only when all of them are paused (`requestAuthorization` now stores the ids as requested to tell). `getSyncStatus()` adds `pausedTypes` and `resyncingTypes`. The paused list is per user and cleared by `signOut()` only; `resetAnchors()` drops pending resyncs.
