@@ -257,6 +257,32 @@ sdk.resetAnchors()
 sdk.stopBackgroundSync()
 ```
 
+### Per-type Pause / Resume / Resync
+
+Ids are the app's type ids (`"heartRate"`, `"distanceCycling"`, ...), stored as sent.
+
+```kotlin
+// Stop syncing a type; the server keeps what it has. Never prompts for permissions.
+sdk.pauseTypes(listOf("heartRate"))
+
+// Sync it again from its kept change token (edits and deletions made meanwhile arrive).
+// A type without a token, or paused for 30+ days, is resynced instead.
+sdk.resumeTypes(listOf("heartRate"))
+
+sdk.getPausedTypes() // ["heartRate"]; cheap enough to poll
+
+// Re-read a type's whole history (bounded by syncDaysBack) and upload it again.
+// Returns once scheduled. Paused types are ignored.
+sdk.resyncTypes(listOf("sleep"))   // suspend
+
+sdk.getSyncStatus()["pausedTypes"]     // List<String>
+sdk.getSyncStatus()["resyncingTypes"]  // List<String>, pending or running
+```
+
+- Health Connect reads some ids from one record (`distanceWalkingRunning` / `distanceCycling`, the blood-pressure ids). That record stops syncing only once every id the app requested for it is paused.
+- The paused list is per user, survives `resetAnchors()` and `requestAuthorization()`, and is cleared by `signOut()`. Pending resyncs are dropped by `resetAnchors()` (the full export it starts covers them).
+- Resync uploads use the normal sync payload; they are not marked as historical.
+
 ### Sign Out
 
 ```kotlin

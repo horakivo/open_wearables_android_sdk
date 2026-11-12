@@ -48,6 +48,8 @@ class OpenWearablesHealthSDK private constructor(
 
     companion object {
         private const val TAG = "OpenWearablesHealthSDK"
+        private const val IDLE_SYNC_POLL_MS = 2_000L
+        private const val IDLE_SYNC_WAIT_MS = 30L * 60L * 1000L
 
         @Volatile
         private var instance: OpenWearablesHealthSDK? = null
@@ -308,7 +310,7 @@ class OpenWearablesHealthSDK private constructor(
         sm.startBackgroundSync()
         // Resume an interrupted export, including one that never landed its first
         // payload (no progress to detect).
-        if (sm.hasResumableSyncSession() || !sm.hasCompletedInitialExport()) {
+        if (sm.hasUnfinishedWork()) {
             logMessage("Found interrupted sync, will resume...")
             sm.syncNow(fullExport = false)
         }
@@ -458,6 +460,9 @@ class OpenWearablesHealthSDK private constructor(
             logMessage("Authorization denied — no health data types granted")
             return false
         }
+        // Kept as sent (before alias folding) to tell which app types share a record when
+        // deciding whether a type is paused. The paused list itself is not touched here.
+        secureStorage.saveRequestedTypes(types)
         val grantedTypes = provider.getTrackedTypes().sorted()
         secureStorage.saveTrackedTypes(grantedTypes)
         logMessage("Authorized ${grantedTypes.size} type(s); denied types are not synced")
@@ -542,6 +547,118 @@ class OpenWearablesHealthSDK private constructor(
 
     fun getSyncStatus(): Map<String, Any?> = ensureSyncManager().getSyncStatus()
 
+    // -----------------------------------------------------------------------
+    // Per-type pause / resume / resync
+    // -----------------------------------------------------------------------
+    //
+    // Ids are the app's type ids ("heartRate", "distanceCycling", ...), stored as sent.
+    // Health Connect reads some of them from one record (distanceWalkingRunning and
+    // distanceCycling; the blood-pressure ids); that record stops syncing only once every
+    // id the app requested for it is paused.
+
+    /**
+     * Stops syncing [types], keeping what the server already has and each type's change
+     * token, so [resumeTypes] picks up what changed meanwhile. Takes effect in a running sync
+     * too (the type leaves it after the current round). Never prompts for permissions;
+     * unknown or not yet authorized ids are stored as well. Persisted per signed-in user and
+     * cleared by [signOut] only.
+     */
+    fun pauseTypes(types: List<String>) {
+        if (types.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val pausedAt = secureStorage.getPausedTypes()
+        for (type in types) pausedAt.putIfAbsent(type, now)
+        secureStorage.savePausedTypes(pausedAt)
+        ensureSyncManager().onTypesPaused(types)
+        logMessage("Paused types: ${types.joinToString()}")
+    }
+
+    /**
+     * Syncs [types] again and starts a sync. A type continues from its kept change token, so
+     * edits and deletions made while paused arrive. A type with no token (paused before its
+     * first export finished) or paused for 30+ days (Health Connect tokens expire) is
+     * resynced instead.
+     */
+    fun resumeTypes(types: List<String>) {
+        val pausedAt = secureStorage.getPausedTypes()
+        val resumed = types.filter { it in pausedAt }
+        if (resumed.isEmpty()) {
+            logMessage("Resume: none of ${types.joinToString()} is paused")
+            return
+        }
+        val sm = ensureSyncManager()
+        val resync = sm.resyncNeededOnResume(resumed, pausedAt)
+        // Resync first: while still paused the type is not read, so no run can start on its
+        // expired token in between.
+        sm.scheduleResync(resync)
+        secureStorage.savePausedTypes(pausedAt.filterKeys { it !in resumed })
+        logMessage(
+            "Resumed types: ${resumed.joinToString()}" +
+                if (resync.isNotEmpty()) " (resync: ${resync.joinToString()})" else ""
+        )
+        syncWhenIdle()
+    }
+
+    /** The paused type ids, exactly as passed to [pauseTypes], in pause order. Cheap; safe to poll. */
+    fun getPausedTypes(): List<String> = secureStorage.getPausedTypes().keys.toList()
+
+    /**
+     * Schedules a full re-read of [types]' history (bounded by `syncDaysBack`) and starts a
+     * sync; returns once scheduled, not when the upload finishes. The server upserts by
+     * record id, so re-sent records do not duplicate. Paused types are ignored. While the
+     * first full export is unfinished, types it has not completed yet are skipped (it
+     * exports them anyway). Pending resyncs show in `getSyncStatus()["resyncingTypes"]`
+     * and are dropped by [resetAnchors] (the full export it starts supersedes them).
+     */
+    suspend fun resyncTypes(types: List<String>) {
+        if (types.isEmpty()) return
+        withContext(dispatchers.io) {
+            val paused = secureStorage.getPausedTypes().keys
+            val ignored = types.filter { it in paused }
+            val sm = ensureSyncManager()
+            val scheduled = sm.resyncCandidates(types.filter { it !in paused })
+            val skipped = types.filter { it !in paused && it !in scheduled }
+            sm.scheduleResync(scheduled)
+            logMessage(
+                "Resync types: ${scheduled.joinToString().ifEmpty { "none" }}" +
+                    (if (ignored.isNotEmpty()) "; ignored paused: ${ignored.joinToString()}" else "") +
+                    (if (skipped.isNotEmpty()) "; skipped (not tracked or not exported yet): ${skipped.joinToString()}" else "")
+            )
+            if (scheduled.isNotEmpty()) syncWhenIdle()
+        }
+    }
+
+    private val idleSyncPending = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Starts a sync for newly scheduled per-type work once no sync is running. Enqueuing the
+     * expedited worker while one runs would cancel it (REPLACE); a running worker re-enqueues
+     * itself for unfinished work anyway, but a sync in the app process does not.
+     */
+    private fun syncWhenIdle() {
+        // A disconnected app must not upload; the change is picked up when sync starts again.
+        if (!isConfigured || !secureStorage.hasSession() || !secureStorage.isSyncActive()) return
+        if (!idleSyncPending.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                val deadline = System.currentTimeMillis() + IDLE_SYNC_WAIT_MS
+                while (SyncManager.processSyncLock.get() && System.currentTimeMillis() < deadline) {
+                    delay(IDLE_SYNC_POLL_MS)
+                }
+                if (SyncManager.processSyncLock.get()) {
+                    logMessage("Sync still running — per-type changes run with the next sync")
+                    return@launch
+                }
+                // KEEP: a worker that just finished may have enqueued its own follow-up.
+                ensureSyncManager().scheduleExpeditedSync(keepExisting = true)
+            } catch (e: Exception) {
+                logMessage("Sync after per-type change failed: ${e.message}")
+            } finally {
+                idleSyncPending.set(false)
+            }
+        }
+    }
+
     suspend fun resumeSync() {
         if (!isConfigured) throw IllegalStateException("Not configured")
         val sm = ensureSyncManager()
@@ -614,9 +731,7 @@ class OpenWearablesHealthSDK private constructor(
                 // WorkManager on OEM skins drops it.
                 // Continued in the expedited worker (foreground service, survives the app
                 // being closed), not in the app process; nothing to do while a sync runs.
-                if ((sm.hasResumableSyncSession() || !sm.hasCompletedInitialExport()) &&
-                    !SyncManager.processSyncLock.get()
-                ) {
+                if (sm.hasUnfinishedWork() && !SyncManager.processSyncLock.get()) {
                     logMessage("Resuming sync after foreground...")
                     if (isConfigured) sm.scheduleExpeditedSync()
                 }
